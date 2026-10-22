@@ -104,6 +104,8 @@ if(WIN32)
         src/platform/win/cloud_intercept.cpp
         src/platform/win/sig_scanner.cpp
         src/platform/win/sc_resolver.cpp
+        src/platform/win/compat.cpp
+        src/platform/win/compat_feed.cpp
         src/platform/win/log.cpp
         src/platform/win/http_server.cpp
         src/platform/win/http_util.cpp
@@ -251,6 +253,37 @@ if(WIN32)
         src/platform/win/sc_resolver.cpp src/platform/win/sig_scanner.cpp)
 endif()
 add_test(NAME steam_resolver_tests COMMAND steam_resolver_tests)
+
+if(WIN32)
+    add_executable(compat_tests
+        tests-fork/compat_tests.cpp
+        src/platform/win/compat.cpp
+        src/platform/win/sig_scanner.cpp
+        src/common/json.cpp
+    )
+    target_include_directories(compat_tests PRIVATE
+        src/common
+        src/platform/win
+    )
+    add_test(NAME compat_tests COMMAND compat_tests)
+endif()
+
+# Standalone compatibility checker consumed by the local steam-monitor watcher.
+# It maps steamclient64.dll without imports or DllMain and never installs hooks.
+if(WIN32)
+    add_executable(cr_compat_check
+        src/platform/win/cr_compat_check.cpp
+        src/platform/win/compat.cpp
+        src/platform/win/sc_resolver.cpp
+        src/platform/win/sig_scanner.cpp
+        src/common/json.cpp
+        src/common/sha256_hmac.cpp
+    )
+    target_include_directories(cr_compat_check PRIVATE
+        src/common
+        src/platform/win
+    )
+endif()
 
 add_executable(autocloud_injection_tests tests-fork/autocloud_injection_tests.cpp)
 target_include_directories(autocloud_injection_tests PRIVATE src/common)

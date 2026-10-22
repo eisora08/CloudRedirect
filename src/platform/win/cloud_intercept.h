@@ -64,6 +64,9 @@ void SetNamespaceApps(const uint32_t* appIds, uint32_t count,
 void InstallServiceMethodHook();
 bool VtableHookInstalled();
 
+// True only when the local report (plus optional feed) allows cloud writes.
+bool IsCompatFull();
+
 // Deferred stats seeding for third-party consumers (CR_SetApps triggers it).
 void SetNeedsSeed(bool v);
 void TriggerDeferredSeed(const std::vector<uint32_t>& apps);

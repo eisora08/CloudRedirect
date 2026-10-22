@@ -10,6 +10,9 @@
 #include "sc_resolver.h"
 #include "sig_scanner.h"
 #include "steam_message_layout.h"
+#include "compat.h"
+#include "compat_feed.h"
+#include "sha256_hmac.h"
 #include "log.h"
 #include "http_server.h"
 #include "vdf.h"
@@ -445,6 +448,113 @@ static std::atomic<uint64_t> g_detectedSteamVersion{0};
 // Cloud-redirect master toggle (default ON). When OFF the DLL still applies manifest pinning + patches but skips HTTP/storage/interception.
 static std::atomic<bool> g_cloudRedirectEnabled{true};
 
+// Compatibility gate. Audit is the safe default: no cloud writes and no
+// manifest hooks until the locally verified report (and, optionally, the feed)
+// says full.
+static std::atomic<int> g_compatStatus{static_cast<int>(Compat::Status::Audit)};
+static Compat::Report g_compatReport;
+static std::mutex g_compatMutex;
+static std::string g_compatSha;
+static bool g_compatFeedEnabled = true;
+static bool g_compatFeedStrict = false;
+static std::vector<std::string> g_compatFeedUrls;
+static bool g_accountIdResolved = false;
+
+bool IsCompatFull() {
+    return g_compatStatus.load(std::memory_order_acquire) ==
+           static_cast<int>(Compat::Status::Full);
+}
+
+static bool CloudGateOpen() {
+    return g_cloudRedirectEnabled.load(std::memory_order_relaxed) && IsCompatFull();
+}
+
+static size_t SteamClientImageSize() {
+    HMODULE module = reinterpret_cast<HMODULE>(g_steamClientBase);
+    if (!module) return 0;
+    MODULEINFO info{};
+    if (!GetModuleInformation(GetCurrentProcess(), module, &info, sizeof(info)))
+        return 0;
+    return info.SizeOfImage;
+}
+
+static std::string ReadSteamChannel() {
+    const REGSAM views[] = {0, KEY_WOW64_32KEY};
+    for (REGSAM view : views) {
+        char value[64]{};
+        DWORD size = sizeof(value);
+        LSTATUS status = RegGetValueA(HKEY_CURRENT_USER, "Software\\Valve\\Steam",
+                                      "BetaKey", RRF_RT_REG_SZ | view,
+                                      nullptr, value, &size);
+        if (status == ERROR_SUCCESS && value[0]) return "beta";
+    }
+    return "stable";
+}
+
+static std::string Sha256File(const std::string& path) {
+    std::ifstream file(FileUtil::Utf8ToPath(path), std::ios::binary);
+    if (!file) return {};
+    std::vector<char> bytes((std::istreambuf_iterator<char>(file)),
+                            std::istreambuf_iterator<char>());
+    if (bytes.empty()) return {};
+    const auto digest = crypto::Sha256(
+        reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
+    return crypto::ToHex(digest.data(), digest.size());
+}
+
+// Caller holds g_compatMutex.
+static void WriteCompatJsonLocked() {
+    if (g_steamPath.empty()) return;
+    const std::string dir = g_steamPath + "cloud_redirect\\";
+    std::error_code ec;
+    std::filesystem::create_directories(FileUtil::Utf8ToPath(dir), ec);
+    if (ec) return;
+    FileUtil::AtomicWriteText(dir + "compat.json", Compat::ToJson(g_compatReport));
+}
+
+static void EvaluateCompat(bool feedPresent, Compat::Status feedStatus) {
+    std::lock_guard<std::mutex> lock(g_compatMutex);
+    Compat::Report local = Compat::BuildStatic(
+        g_steamClientBase, SteamClientImageSize(), g_resolved,
+        USER_OFF_ACCOUNTID, g_accountIdResolved, g_messageLayout);
+    local.channel = ReadSteamChannel();
+    local.steamVersion = g_detectedSteamVersion.load(std::memory_order_relaxed);
+    local.sha256 = g_compatSha;
+    local.tool = "CloudRedirect/" CR_RELEASE_VERSION;
+    if (g_compatSha.empty()) {
+        local.status = Compat::Status::Audit;
+        local.reasons.push_back("steamclient_sha256");
+    } else {
+        local.status = Compat::Decide(local, feedPresent, feedStatus, g_compatFeedStrict);
+    }
+
+    g_compatReport = local;
+    g_compatStatus.store(static_cast<int>(local.status), std::memory_order_release);
+    WriteCompatJsonLocked();
+
+    LOG("[Compat] status=%s sha=%s missing=%zu", Compat::StatusName(local.status),
+        g_compatSha.c_str(), local.reasons.size());
+}
+
+static void StartCompatFeedFetch() {
+    if (!g_compatFeedEnabled || g_compatSha.empty()) return;
+    const std::string sha = g_compatSha;
+    std::thread worker([sha]() {
+        const std::vector<std::string> urls =
+            g_compatFeedUrls.empty() ? CompatFeed::DefaultUrls(sha) : g_compatFeedUrls;
+        const CompatFeed::Result result = CompatFeed::Fetch(sha, urls);
+        if (!result.present) {
+            LOG("[Compat] feed unavailable: %s", result.error.c_str());
+            return;
+        }
+        if (!result.fromCache)
+            CompatFeed::SaveCache(g_steamPath, sha, result.body);
+        EvaluateCompat(true, result.status);
+    });
+    std::lock_guard<std::mutex> lock(g_bgThreadsMutex);
+    g_bgThreads.push_back(std::move(worker));
+}
+
 // Manifest pinning (depot -> manifest override)
 // Config lives in Steam folder (per-system), NOT AppData (per-user).
 static std::atomic<bool> g_manifestPinsEnabled{false};
@@ -696,104 +806,20 @@ static uintptr_t FindCurrentUser() {
     return userPtr;
 }
 
-// Scan for CUser accountId offset: find UserGameStats_%u string -> code xref ->
-// backward scan for mov reg32,[reg+disp32] -> disp32 is the offset. 0 on failure.
+// Find CUser::accountId by xref. Returns 0 when the pattern is missing.
 static uint32_t ScanUserAccountIdOffset() {
     HMODULE hSC = GetModuleHandleA("steamclient64.dll");
     if (!hSC) return 0;
-    uintptr_t base = (uintptr_t)hSC;
-
     MODULEINFO mi = {};
     if (!GetModuleInformation(GetCurrentProcess(), hSC, &mi, sizeof(mi)))
         return 0;
-    const uint8_t* img = (const uint8_t*)base;
-    size_t imgSize = mi.SizeOfImage;
-
-    // Step 1: find "UserGameStats_%u" in .rdata (may be mid-string; walk back to NUL).
-    const char needle[] = "UserGameStats_%u";
-    const size_t needleLen = sizeof(needle) - 1;  // exclude NUL
-    uintptr_t matchAddr = 0;
-    for (size_t i = 0; i + needleLen < imgSize; i++) {
-        if (memcmp(img + i, needle, needleLen) == 0) {
-            matchAddr = base + i;
-            break;
-        }
-    }
-    if (!matchAddr) {
-        LOG("[Scan] UserGameStats string not found");
-        return 0;
-    }
-
-    // Walk backward to the start of the containing C string (first NUL before match).
-    uintptr_t strAddr = matchAddr;
-    const uint8_t* matchPtr = img + (matchAddr - base);
-    while (matchPtr > img && *(matchPtr - 1) != 0) {
-        matchPtr--;
-        strAddr--;
-    }
-    LOG("[Scan] UserGameStats needle at sc+0x%llX, containing string at sc+0x%llX: \"%.64s\"",
-        (unsigned long long)(matchAddr - base), (unsigned long long)(strAddr - base),
-        (const char*)(img + (strAddr - base)));
-
-    // Step 2: find QWORD pointer to this string in .rdata/.data (off_XXXX entry).
-    uintptr_t ptrAddr = 0;
-    for (size_t i = 0; i + 8 <= imgSize; i += 8) {
-        if (*(const uintptr_t*)(img + i) == strAddr) {
-            ptrAddr = base + i;
-            break;
-        }
-    }
-    if (!ptrAddr) {
-        LOG("[Scan] UserGameStats string pointer not found");
-        return 0;
-    }
-
-    // Step 3: find RIP-relative xref: 48 8B 15 XX XX XX XX (mov rdx, [rip+disp32]).
-    uintptr_t xrefAddr = 0;
-    for (size_t i = 0; i + 7 < imgSize; i++) {
-        if (img[i] == 0x48 && img[i+1] == 0x8B && img[i+2] == 0x15) {
-            int32_t disp = *(const int32_t*)(img + i + 3);
-            uintptr_t target = (base + i + 7) + disp;
-            if (target == ptrAddr) {
-                xrefAddr = base + i;
-                break;
-            }
-        }
-    }
-    if (!xrefAddr) {
-        LOG("[Scan] UserGameStats code xref not found");
-        return 0;
-    }
-
-    // Step 4: walk backward for `mov r32, [reg+disp32]` (accountId load, disp in 256..4096).
-    const uint8_t* scan = (const uint8_t*)xrefAddr;
-    const uint8_t* scanStart = scan - 64;
-    if (scanStart < img) scanStart = img;
-    for (const uint8_t* p = scan - 3; p >= scanStart; p--) {
-        // mov r32, [r64+disp32]: opcode 8B, ModR/M = XX_reg_101 (mod=10, rm=101=rbp/r13
-        // won't appear here, rm varies). ModR/M mod=10 means [reg+disp32].
-        // With REX.B (0x41): source is R8-R15.
-        uint8_t op = *p;
-        bool hasRex = (op >= 0x40 && op <= 0x4F);
-        const uint8_t* modrm_p = hasRex ? p + 1 : p;
-        if (*modrm_p != 0x8B) continue;
-        uint8_t modrm = *(modrm_p + 1);
-        uint8_t mod = (modrm >> 6) & 3;
-        uint8_t rm  = modrm & 7;
-        if (mod != 2) continue;  // mod=10: [reg+disp32]
-        // rm=4 means SIB byte follows (skip, more complex addressing)
-        if (rm == 4) continue;
-        int32_t offset;
-        memcpy(&offset, modrm_p + 2, 4);
-        if (offset >= 256 && offset <= 4096) {
-            uint32_t result = (uint32_t)offset;
-            LOG("[Scan] Resolved USER_OFF_ACCOUNTID = %u (0x%X) from code at sc+0x%llX",
-                result, result, (unsigned long long)(p - img));
-            return result;
-        }
-    }
-    LOG("[Scan] Could not extract accountId offset from nearby instructions");
-    return 0;
+    const uint32_t offset =
+        Compat::ScanAccountIdOffset((uintptr_t)hSC, mi.SizeOfImage);
+    if (offset)
+        LOG("[Scan] Resolved USER_OFF_ACCOUNTID = %u (0x%X)", offset, offset);
+    else
+        LOG("[Scan] UserGameStats xref not found");
+    return offset;
 }
 
 // Read account id from CUser when no RPC header is available yet. SEH-isolated.
@@ -2120,6 +2146,11 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
 
+    if (!CloudGateOpen()) {
+        LOG("[Compat] gate closed, %s passed through", methodName);
+        return g_originalSlot5(thisptr, methodName, request, response, flags);
+    }
+
     // Check if it's a Cloud RPC we handle (zero-alloc check via strcmp)
     // Request/response RPCs only - notifications go through slots 7/8
     bool isCloudRpc = (strcmp(methodName, RPC_GET_CHANGELIST) == 0 || strcmp(methodName, RPC_BEGIN_BATCH) == 0 ||
@@ -2403,6 +2434,11 @@ static bool __fastcall NotificationWrapperHook(void* thisptr, const char* method
         return g_originalSlot8(thisptr, methodName, request);
     }
 
+    if (!CloudGateOpen()) {
+        LOG("[Compat] gate closed, notification %s passed through", methodName);
+        return g_originalSlot8(thisptr, methodName, request);
+    }
+
     if (!request) {
         LOG("[VtHook-Notif] %s: null request, passing through", methodName);
         return g_originalSlot8(thisptr, methodName, request);
@@ -2499,6 +2535,11 @@ static bool __fastcall NotificationDirectHook(void* thisptr, const char* methodN
 
     // Only intercept Cloud.* notifications
     if (strncmp(methodName, "Cloud.", 6) != 0) {
+        return g_originalSlot7(thisptr, methodName, bodyObj, flags);
+    }
+
+    if (!CloudGateOpen()) {
+        LOG("[Compat] gate closed, notification %s passed through", methodName);
         return g_originalSlot7(thisptr, methodName, bodyObj, flags);
     }
 
@@ -4260,14 +4301,28 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
     // or function-pointer resolution. Falls back to hardcoded RVAs on failure.
     RunAutoResolver();
 
-    // Resolve CUser::accountId offset from steamclient64 (fallback: 570).
+    // Resolve CUser::accountId offset. No blind 570 fallback: an unresolved
+    // offset is a compatibility failure and forces audit mode.
     {
         uint32_t scannedOff = ScanUserAccountIdOffset();
-        if (scannedOff != 0)
+        g_accountIdResolved = scannedOff != 0;
+        if (g_accountIdResolved)
             USER_OFF_ACCOUNTID = scannedOff;
         else
-            LOG("[Scan] USER_OFF_ACCOUNTID: using fallback %u", USER_OFF_ACCOUNTID);
+            LOG("[Scan] USER_OFF_ACCOUNTID unresolved -- audit mode, no cloud writes");
     }
+
+    // Probe the CProtoBufMsg wrapper offsets before writing the report.
+    {
+        SteamMessageLayout::Layout probed;
+        if (Compat::ProbeMessageLayout(g_resolved, probed))
+            g_messageLayout = probed;
+        else
+            LOG("[Compat] message layout probe failed");
+    }
+
+    g_compatSha = Sha256File(g_steamPath + "steamclient64.dll");
+    EvaluateCompat(false, Compat::Status::Audit);
 
     // Auto-detect namespace apps from {steamPath}\config\stplug-in\*.lua, restricted to self-unlocking luas (base-game addappid for own id).
     std::string pluginDir = g_steamPath + "config\\stplug-in\\*";
@@ -4326,6 +4381,31 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
             // cloud_redirect defaults to true for backward compat with existing users
             if (pinCfg["cloud_redirect"].type == Json::Type::Bool)
                 g_cloudRedirectEnabled = pinCfg["cloud_redirect"].boolean();
+
+            // compat_feed: optional network overlay on the local report.
+            auto& feedCfg = pinCfg["compat_feed"];
+            if (feedCfg.type == Json::Type::Object) {
+                if (feedCfg["enabled"].type == Json::Type::Bool)
+                    g_compatFeedEnabled = feedCfg["enabled"].boolean();
+                if (feedCfg["strict"].type == Json::Type::Bool)
+                    g_compatFeedStrict = feedCfg["strict"].boolean();
+                auto& urls = feedCfg["url_templates"];
+                if (urls.type == Json::Type::Array) {
+                    g_compatFeedUrls.clear();
+                    const std::string channel = ReadSteamChannel();
+                    for (auto& entry : urls.arrVal) {
+                        std::string url = entry.str();
+                        if (url.empty()) continue;
+                        size_t pos = 0;
+                        while ((pos = url.find("{sha256}", pos)) != std::string::npos)
+                            url.replace(pos, 8, g_compatSha);
+                        pos = 0;
+                        while ((pos = url.find("{channel}", pos)) != std::string::npos)
+                            url.replace(pos, 9, channel);
+                        g_compatFeedUrls.push_back(std::move(url));
+                    }
+                }
+            }
 
             if (!cloudSaveOnly) {
 
@@ -4428,6 +4508,23 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
     if (!g_cloudRedirectEnabled.load()) {
         LOG("Cloud redirection disabled, skipping cloud init");
         LOG("CloudIntercept initialized (manifest pinning only), steam=%s", g_steamPath.c_str());
+        return;
+    }
+
+    // Apply the cached compatibility feed (if any), then refresh it in the
+    // background. The gate stays closed until the local report is full.
+    {
+        CompatFeed::Result cached;
+        if (g_compatFeedEnabled && !g_compatSha.empty())
+            cached = CompatFeed::LoadCached(g_steamPath, g_compatSha);
+        EvaluateCompat(cached.present, cached.status);
+        if (g_compatFeedEnabled)
+            StartCompatFeedFetch();
+    }
+
+    if (!IsCompatFull()) {
+        LOG("[Compat] audit mode: cloud init skipped, no writes will be attempted");
+        LOG("CloudIntercept initialized (compat audit only), steam=%s", g_steamPath.c_str());
         return;
     }
 
@@ -4931,6 +5028,10 @@ static constexpr size_t DETOUR_PATCH_SIZE = 14;   // FF 25 00 00 00 00 <8-byte a
 static constexpr size_t TRAMPOLINE_COPY  = 15;    // first 3 instructions of RecvPkt prologue
 
 void InstallRecvPktDetour() {
+    if (!IsCompatFull()) {
+        LOG("[RecvPkt] compat audit mode, skipping detour");
+        return;
+    }
     HMODULE hSC = GetModuleHandleA("steamclient64.dll");
     if (!hSC) { LOG("[RecvPkt] steamclient64.dll not loaded"); return; }
     uintptr_t scBase = (uintptr_t)hSC;
@@ -5018,6 +5119,10 @@ void InstallRecvPktDetour() {
 }
 
 void InstallManifestPinHook() {
+    if (!IsCompatFull()) {
+        LOG("[ManifestPin] compat audit mode, skipping hook");
+        return;
+    }
     if (!g_manifestPinsEnabled.load(std::memory_order_relaxed)) {
         LOG("[ManifestPin] Pins not enabled, skipping hook");
         return;
@@ -5126,6 +5231,10 @@ static uint8_t  g_releaseStateOrig[6] = {};
 static std::atomic<bool> g_releaseStatePatched{false};
 
 void InstallReleaseStateNop() {
+    if (!IsCompatFull()) {
+        LOG("[Compat] audit mode, skipping release-state patch");
+        return;
+    }
     // Patch GetEffectiveReleaseState to always return 4 (RELEASED).
     HMODULE hSC = GetModuleHandleA("steamclient64.dll");
     if (!hSC) return;
@@ -5282,6 +5391,10 @@ static const uint8_t kP8bMask[] = {
 };
 
 void InstallManifestEndpointOverride() {
+    if (!IsCompatFull()) {
+        LOG("[ManifestEP] compat audit mode, skipping");
+        return;
+    }
     if (g_manifestEndpoint.empty()) {
         LOG("[ManifestEP] No endpoint configured, skipping");
         return;
@@ -6285,6 +6398,10 @@ static void SweepNamespaceSchemas() {
 }
 
 void InstallGamesPlayedHook() {
+    if (!IsCompatFull()) {
+        LOG("[GamesPlayed] compat audit mode, skipping hook");
+        return;
+    }
     if (!HasNamespaceApps()) return;
     // Always install: playtime tracking + non-Steam-game spoof (gated per-call).
 
@@ -6482,7 +6599,7 @@ static std::vector<uint8_t> RewriteGamesPlayed(const uint8_t* body, uint32_t bod
 // OnSendPkt â€” vtable hook handles namespace Cloud RPCs; this is the fallback path.
 bool OnSendPkt(void* thisptr, const uint8_t* data, uint32_t size) {
 
-    if (!g_cloudRedirectEnabled.load(std::memory_order_relaxed)) return false;
+    if (!CloudGateOpen()) return false;
     if (g_proxySending) return false;
     if (g_shuttingDown.load(std::memory_order_acquire)) return false;
 

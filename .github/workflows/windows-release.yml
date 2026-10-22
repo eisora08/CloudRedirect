@@ -1,9 +1,10 @@
 name: Windows build and release
 
-# Builds only the native x64 cloud_redirect.dll with MSVC and, for
-# vX.Y.Z[.N] tags, creates/updates a GitHub release with the DLL and its bare
-# sha256. The UI/steam_api bundling from upstream is intentionally not
-# built here: consumers (e.g. OpenSteamTool) host the DLL directly.
+# Builds only the native x64 cloud_redirect.dll and the cr_compat_check
+# reporter with MSVC and, for vX.Y.Z[.N] tags, creates/updates a GitHub release
+# with both binaries and their bare sha256. The UI/steam_api bundling from
+# upstream is intentionally not built here: consumers (e.g. OpenSteamTool)
+# host the DLL directly.
 
 on:
   push:
@@ -67,13 +68,13 @@ jobs:
           $sha = '${{ github.sha }}'.Substring(0, 7)
           cmake -S . -B build -G "${{ steps.vs.outputs.generator }}" -A x64 -T $env:MSVC_TOOLSET "-DCR_GIT_SHA=$sha"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --build build --config Release --target cloud_redirect
+          cmake --build build --config Release --target cloud_redirect cr_compat_check
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Build and run fork unit tests
         shell: pwsh
         run: |
-          cmake --build build --config Release --target stats_store_fork_tests autocloud_injection_tests steam_message_layout_tests steam_resolver_tests
+          cmake --build build --config Release --target stats_store_fork_tests autocloud_injection_tests steam_message_layout_tests steam_resolver_tests compat_tests
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/Release/stats_store_fork_tests.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
@@ -83,12 +84,15 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/Release/steam_resolver_tests.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/Release/compat_tests.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Collect release assets
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item build/Release/cloud_redirect.dll dist/
+          Copy-Item build/Release/cr_compat_check.exe dist/
           foreach ($f in Get-ChildItem dist -File) {
             # Bare hash only: the in-app updater ignores .sha256 files that are not exactly 64 characters.
             $h = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
