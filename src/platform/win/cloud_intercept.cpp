@@ -13,6 +13,7 @@
 #include "compat.h"
 #include "compat_feed.h"
 #include "sha256_hmac.h"
+#include "update_util.h"
 #include "log.h"
 #include "http_server.h"
 #include "vdf.h"
@@ -3970,6 +3971,10 @@ static std::string GetDllPath() {
     return FileUtil::WideToUtf8(wpath, n);
 }
 
+static std::string ComputeBufferSHA256(const std::string& data) {
+    return crypto::Sha256Hex(data);
+}
+
 // SHA-256 of a file on disk, lowercase hex.
 static std::string ComputeFileSHA256(const std::string& path) {
     HANDLE hFile = CreateFileW(FileUtil::Utf8ToPath(path).c_str(),
@@ -4141,80 +4146,96 @@ static void TryAutoUpdateDll() {
         }
     }
 
-    // Compare local DLL hash against published hash; skip download if unchanged.
+    // The updater must never install bytes it cannot verify. Require the
+    // published .sha256 asset, validate it, and (below) hash the downloaded
+    // buffer before touching the live DLL. A missing/malformed hash is a hard
+    // failure: the previous behavior fell through and installed an unverified
+    // download.
     std::string dllPath = GetDllPath();
-    if (!sha256DownloadUrl.empty() && !dllPath.empty()) {
-        std::string localHash = ComputeFileSHA256(dllPath);
-        if (!localHash.empty()) {
-            LOG("[AutoUpdate] Local DLL SHA-256: %s", localHash.c_str());
-
-            // Fetch published hash file
-            auto fetchSmallFile = [&](const std::string& fullUrl) -> std::string {
-                size_t schemeEnd = fullUrl.find("://");
-                if (schemeEnd == std::string::npos) return {};
-                size_t hostStart = schemeEnd + 3;
-                size_t pathStart = fullUrl.find('/', hostStart);
-                std::string host = (pathStart != std::string::npos)
-                    ? fullUrl.substr(hostStart, pathStart - hostStart) : fullUrl.substr(hostStart);
-                std::string path = (pathStart != std::string::npos) ? fullUrl.substr(pathStart) : "/";
-
-                auto wHost = HttpUtil::Widen(host);
-                auto wPath = HttpUtil::Widen(path);
-                HINTERNET hC = WinHttpConnect(hSession, wHost.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
-                if (!hC) return {};
-                HINTERNET hR = WinHttpOpenRequest(hC, L"GET", wPath.c_str(),
-                    nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-                if (!hR) { WinHttpCloseHandle(hC); return {}; }
-                DWORD pol = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
-                WinHttpSetOption(hR, WINHTTP_OPTION_REDIRECT_POLICY, &pol, sizeof(pol));
-
-                BOOL s = WinHttpSendRequest(hR, WINHTTP_NO_ADDITIONAL_HEADERS, 0, nullptr, 0, 0, 0);
-                if (s) s = WinHttpReceiveResponse(hR, nullptr);
-                std::string result;
-                if (s) {
-                    DWORD code = 0, cl = sizeof(code);
-                    WinHttpQueryHeaders(hR, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                        WINHTTP_HEADER_NAME_BY_INDEX, &code, &cl, WINHTTP_NO_HEADER_INDEX);
-                    if (code == 200) {
-                        DWORD a, g;
-                        while (WinHttpQueryDataAvailable(hR, &a) && a > 0) {
-                            if (result.size() + a > 4096) break;
-                            size_t o = result.size();
-                            result.resize(o + a);
-                            g = 0;
-                            WinHttpReadData(hR, &result[o], a, &g);
-                            result.resize(o + g);
-                        }
-                    }
-                }
-                WinHttpCloseHandle(hR);
-                WinHttpCloseHandle(hC);
-                return result;
-            };
-
-            std::string remoteHash = fetchSmallFile(sha256DownloadUrl);
-            // Trim
-            while (!remoteHash.empty() && (remoteHash.back() == '\n' || remoteHash.back() == '\r' || remoteHash.back() == ' '))
-                remoteHash.pop_back();
-
-            if (remoteHash.size() == 64) {
-                LOG("[AutoUpdate] Remote DLL SHA-256: %s", remoteHash.c_str());
-                if (localHash == remoteHash) {
-                    LOG("[AutoUpdate] DLL is up to date (hash match)");
-                    WinHttpCloseHandle(hSession);
-                    return;
-                }
-                LOG("[AutoUpdate] Hash mismatch, update needed");
-            } else {
-                LOG("[AutoUpdate] Could not fetch remote hash (%zu bytes), falling back to download",
-                    remoteHash.size());
-            }
-        }
+    if (dllPath.empty()) {
+        LOG("[AutoUpdate] Cannot determine DLL path, aborting");
+        WinHttpCloseHandle(hSession);
+        return;
+    }
+    if (sha256DownloadUrl.empty()) {
+        LOG("[AutoUpdate] Release %s has no cloud_redirect.dll.sha256 asset; "
+            "refusing unverified update", bestTag.c_str());
+        WinHttpCloseHandle(hSession);
+        return;
     }
 
-    // Download the DLL (follows redirects).
+    auto fetchSmallFile = [&](const std::string& fullUrl) -> std::string {
+        if (fullUrl.rfind("https://", 0) != 0) return {};
+        size_t schemeEnd = fullUrl.find("://");
+        if (schemeEnd == std::string::npos) return {};
+        size_t hostStart = schemeEnd + 3;
+        size_t pathStart = fullUrl.find('/', hostStart);
+        std::string host = (pathStart != std::string::npos)
+            ? fullUrl.substr(hostStart, pathStart - hostStart) : fullUrl.substr(hostStart);
+        std::string path = (pathStart != std::string::npos) ? fullUrl.substr(pathStart) : "/";
+
+        auto wHost = HttpUtil::Widen(host);
+        auto wPath = HttpUtil::Widen(path);
+        HINTERNET hC = WinHttpConnect(hSession, wHost.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+        if (!hC) return {};
+        HINTERNET hR = WinHttpOpenRequest(hC, L"GET", wPath.c_str(),
+            nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+        if (!hR) { WinHttpCloseHandle(hC); return {}; }
+        DWORD pol = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
+        WinHttpSetOption(hR, WINHTTP_OPTION_REDIRECT_POLICY, &pol, sizeof(pol));
+
+        BOOL s = WinHttpSendRequest(hR, WINHTTP_NO_ADDITIONAL_HEADERS, 0, nullptr, 0, 0, 0);
+        if (s) s = WinHttpReceiveResponse(hR, nullptr);
+        std::string result;
+        if (s) {
+            DWORD code = 0, cl = sizeof(code);
+            WinHttpQueryHeaders(hR, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                WINHTTP_HEADER_NAME_BY_INDEX, &code, &cl, WINHTTP_NO_HEADER_INDEX);
+            if (code == 200) {
+                DWORD a, g;
+                while (WinHttpQueryDataAvailable(hR, &a) && a > 0) {
+                    if (result.size() + a > 4096) { result.clear(); break; }
+                    size_t o = result.size();
+                    result.resize(o + a);
+                    g = 0;
+                    WinHttpReadData(hR, &result[o], a, &g);
+                    result.resize(o + g);
+                }
+            }
+        }
+        WinHttpCloseHandle(hR);
+        WinHttpCloseHandle(hC);
+        return result;
+    };
+
+    std::string remoteHash = fetchSmallFile(sha256DownloadUrl);
+    while (!remoteHash.empty() &&
+           (remoteHash.back() == '\n' || remoteHash.back() == '\r' || remoteHash.back() == ' '))
+        remoteHash.pop_back();
+    remoteHash = LowerAscii(remoteHash);
+    if (!IsSha256Hex(remoteHash)) {
+        LOG("[AutoUpdate] Invalid published SHA-256 for %s (%zu chars); "
+            "refusing unverified update", bestTag.c_str(), remoteHash.size());
+        WinHttpCloseHandle(hSession);
+        return;
+    }
+
+    std::string localHash = ComputeFileSHA256(dllPath);
+    if (!localHash.empty()) {
+        LOG("[AutoUpdate] Local DLL SHA-256: %s", localHash.c_str());
+        LOG("[AutoUpdate] Remote DLL SHA-256: %s", remoteHash.c_str());
+        if (localHash == remoteHash) {
+            LOG("[AutoUpdate] DLL is up to date (hash match)");
+            WinHttpCloseHandle(hSession);
+            return;
+        }
+        LOG("[AutoUpdate] Hash mismatch, update needed");
+    }
+
+    // Download the DLL (follows HTTPS redirects).
 
     auto downloadDll = [&](const std::string& fullUrl) -> std::string {
+        if (fullUrl.rfind("https://", 0) != 0) return {};
         size_t schemeEnd = fullUrl.find("://");
         if (schemeEnd == std::string::npos) return {};
         size_t hostStart = schemeEnd + 3;
@@ -4235,7 +4256,7 @@ static void TryAutoUpdateDll() {
             WINHTTP_FLAG_SECURE);
         if (!hDlReq) { WinHttpCloseHandle(hDlConn); return {}; }
 
-        DWORD policy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+        DWORD policy = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
         WinHttpSetOption(hDlReq, WINHTTP_OPTION_REDIRECT_POLICY, &policy, sizeof(policy));
         WinHttpSetTimeouts(hDlReq, 5000, 5000, 60000, 60000);
 
@@ -4280,17 +4301,17 @@ static void TryAutoUpdateDll() {
         return;
     }
 
-    LOG("[AutoUpdate] Downloaded %zu bytes", dllBytes.size());
+    const std::string downloadedHash = ComputeBufferSHA256(dllBytes);
+    if (downloadedHash != remoteHash) {
+        LOG("[AutoUpdate] Downloaded DLL SHA-256 mismatch (expected %s, got %s); "
+            "refusing to install", remoteHash.c_str(), downloadedHash.c_str());
+        WinHttpCloseHandle(hSession);
+        return;
+    }
+    LOG("[AutoUpdate] Downloaded %zu bytes, SHA-256 verified", dllBytes.size());
     WinHttpCloseHandle(hSession);
 
     // Replace DLL on disk
-    if (dllPath.empty()) {
-        dllPath = GetDllPath();
-        if (dllPath.empty()) {
-            LOG("[AutoUpdate] Cannot determine DLL path, aborting");
-            return;
-        }
-    }
 
     std::string newPath = dllPath + ".new";
     std::string oldPath = dllPath + ".old";

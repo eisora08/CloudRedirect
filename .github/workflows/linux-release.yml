@@ -134,8 +134,8 @@ jobs:
       - name: Run 32-bit StoreStats hook compatibility regression
         run: |
           set -e
-          cmake --build build-linux32 --target stats_store_hook_tests autocloud_injection_tests -j"$(nproc)"
-          ctest --test-dir build-linux32 -R '^(stats_store_hook_tests|autocloud_injection_tests)$' --output-on-failure
+          cmake --build build-linux32 --target stats_store_hook_tests autocloud_injection_tests pending_ops_journal_tests trash_util_tests -j"$(nproc)"
+          ctest --test-dir build-linux32 -R '^(stats_store_hook_tests|autocloud_injection_tests|pending_ops_journal_tests|trash_util_tests)$' --output-on-failure
 
       - name: Build and run fork unit tests (64-bit host build of the shared code)
         run: |
@@ -143,9 +143,8 @@ jobs:
           sha=$(echo '${{ github.sha }}' | cut -c1-7)
           cmake -S . -B build-linux64 -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=gcc-12 -DCMAKE_CXX_COMPILER=g++-12 "-DCR_GIT_SHA=$sha"
-          cmake --build build-linux64 --target stats_store_fork_tests autocloud_injection_tests -j"$(nproc)"
-          ./build-linux64/stats_store_fork_tests
-          ./build-linux64/autocloud_injection_tests
+          cmake --build build-linux64 --target stats_store_fork_tests autocloud_injection_tests steam_message_layout_tests pending_ops_journal_tests trash_util_tests -j"$(nproc)"
+          ctest --test-dir build-linux64 -R '^(stats_store_fork_tests|autocloud_injection_tests|steam_message_layout_tests|pending_ops_journal_tests|trash_util_tests)$' --output-on-failure
 
       - name: Upload native binaries
         uses: actions/upload-artifact@v5

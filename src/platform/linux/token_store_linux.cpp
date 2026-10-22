@@ -157,6 +157,16 @@ static std::string ReadTokenFileFallback(const std::string& path, std::string& o
         outError = "path is not a regular file";
         return {};
     }
+    // The fallback is plaintext. Tighten legacy/mis-created files instead of
+    // leaving OAuth refresh tokens group/world-readable.
+    if ((st.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+        if (chmod(path.c_str(), 0600) == 0) {
+            LOG("[TokenStorage] Tightened permissions on %s (0600)", path.c_str());
+        } else {
+            LOG("[TokenStorage] WARNING: %s is readable by group/other and chmod failed: %s",
+                path.c_str(), strerror(errno));
+        }
+    }
     if (access(path.c_str(), R_OK) != 0) {
         outError = "permission denied (cannot read)";
         return {};

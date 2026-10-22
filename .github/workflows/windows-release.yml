@@ -74,17 +74,9 @@ jobs:
       - name: Build and run fork unit tests
         shell: pwsh
         run: |
-          cmake --build build --config Release --target stats_store_fork_tests autocloud_injection_tests steam_message_layout_tests steam_resolver_tests compat_tests
+          cmake --build build --config Release --target stats_store_fork_tests autocloud_injection_tests steam_message_layout_tests steam_resolver_tests compat_tests pending_ops_journal_tests trash_util_tests
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          & build/Release/stats_store_fork_tests.exe
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          & build/Release/autocloud_injection_tests.exe
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          & build/Release/steam_message_layout_tests.exe
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          & build/Release/steam_resolver_tests.exe
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          & build/Release/compat_tests.exe
+          ctest --test-dir build -C Release --output-on-failure
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Collect release assets
