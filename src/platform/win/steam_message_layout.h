@@ -9,6 +9,13 @@ namespace SteamMessageLayout {
 struct Layout {
     uint32_t header = 0;
     uint32_t body = 0;
+    // Fields derived from the probed header. emsg/hdr follow the same +8 shift
+    // as header/body when Steam grows CProtoBufMsgBase. desc/conn are only
+    // known for the verified 0x30 header layout; zero means "do not use".
+    uint32_t emsg = 0;
+    uint32_t hdr = 0;
+    uint32_t desc = 0;
+    uint32_t conn = 0;
 };
 
 // Decode the wrapper accesses used by Steam itself, independently in the
@@ -50,6 +57,15 @@ inline bool Resolve(const uint8_t* reply, size_t replySize,
     }
     if (!headerMatches || bodyMatches != 1) return false;
     out = notification;
+    // The EMsg word sits immediately before the header pointer. The header is
+    // the same pointer field the adapters read. desc/conn are known for the
+    // current 0x30 layout only; leaving them zero makes callers fail closed.
+    out.emsg = out.header >= 8 ? out.header - 8 : 0;
+    out.hdr = out.header;
+    if (out.header == 0x30) {
+        out.desc = 0x08;
+        out.conn = 0x1C;
+    }
     return true;
 }
 

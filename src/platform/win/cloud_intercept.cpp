@@ -40,6 +40,7 @@
 #include <atomic>
 #include <cstdarg>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <sstream>
 #include <queue>
@@ -70,13 +71,6 @@ static constexpr uint32_t HDR_JOBID_TARGET = 11;
 static constexpr uint32_t HDR_TARGET_JOB_NAME = 12;
 static constexpr uint32_t HDR_ERESULT = 13;
 
-// Payload.dll RVAs (still needed for SteamTools integration)
-static constexpr uintptr_t RVA_RECV_PKT_GLOBAL     = 0x1CAB48;
-static constexpr uintptr_t RVA_CM_HANDLER_ORIG     = 0x1CAAF0;  // g_pfnOriginalCMServerHandler
-static constexpr uintptr_t RVA_CM_VTABLE_SLOT      = 0x1CAB38;  // vtable slot where payload installed CMServerHandler_Hooked
-static constexpr uintptr_t RVA_DEPOT_MANIFESTS     = 0x1C3868;  // g_pDepotManifests (heap ptr)
-static constexpr uintptr_t RVA_DEPOT_MANIFEST_CNT  = 0x1C3870;  // g_nDepotManifestCount
-
 static constexpr uint32_t EMSG_CLIENT_PICSPRODUCTINFO = 8903;
 
 // CMsgClientGamesPlayed EMsg variants
@@ -93,8 +87,8 @@ static constexpr uint32_t GP_FIELD_GAME_ID         = 2;   // fixed64
 static constexpr uint32_t GP_FIELD_GAME_EXTRA_INFO = 7;   // string
 static constexpr uint32_t GP_FIELD_OWNER_ID        = 12;  // uint32
 
-// steamclient64.dll RVAs for manifest pinning inline detour
-// IDA image base: 0x138000000
+// Manifest pinning inline detour. The address is resolved by ScResolver; the
+// signature below describes the target, not a fixed RVA.
 // sub_1384C4040 = CUserAppManager::BuildDepotDependency
 // Signature: __int64 __fastcall(QWORD* a1, uint a2, int64 a3, int64 a4, int64 a5, int64 a6, DWORD* a7, BYTE* a8)
 //   a1 (rcx) = CUserAppManager*
@@ -103,97 +97,43 @@ static constexpr uint32_t GP_FIELD_OWNER_ID        = 12;  // uint32
 //   a5 ([rsp+28h]) = output depot vector (DLC/shared depots)
 // Depot vectors: *(QWORD*)vec = array base, *(int*)(vec+16) = count
 // Each entry is 32 bytes: {uint32 depotId, uint32 appId, uint64 manifestId, ...}
-static constexpr uintptr_t SC_RVA_BUILD_DEPOT_DEPENDENCY = 0x4B13A0;
 static constexpr size_t SC_BDD_STOLEN_BYTES = 14;  // first 14 bytes of prologue
 
 // CProtoBufMsg::BAsyncSend(uint32_t connectionHandle)
 // Hooks this to inject game_extra_info into CMsgClientGamesPlayed before serialization.
-static constexpr uintptr_t SC_RVA_BASYNC_SEND = 0xCF9590;
 static constexpr size_t SC_BAS_STOLEN_BYTES = 15;   // 5+5+1+4 bytes of prologue
-// CProtoBufMsg layout offsets — Steam 11.12.30.07 (Oct 2026, verified by disasm):
-//   +0x00 vtable, +0x08 descriptor*, +0x18 owns-flag(byte=1),
-//   +0x24 -1, +0x28 emsg|PROTO_FLAG, +0x30 header*(CMsgProtoBufHeader),
-//   +0x38 body*(MessageLite, finalize-allocated), +0x40 a3, object size 0x50.
-static constexpr uint32_t CPROTOBUFMSG_OFF_DESC   = 0x08;  // typed-body descriptor vtable*
-static constexpr uint32_t CPROTOBUFMSG_OFF_CONN   = 0x1C;  // uint32_t connection handle (unverified in 11.12.30.07; vestigial — BAsyncSend takes conn as param)
-static constexpr uint32_t CPROTOBUFMSG_OFF_EMSG   = 0x28;  // uint32_t EMsg | PROTO_FLAG
-static constexpr uint32_t CPROTOBUFMSG_OFF_HDR    = 0x30;  // CMsgProtoBufHeader* (ctor-allocated)
-static constexpr uint32_t CPROTOBUFMSG_OFF_BODY   = 0x38;  // protobuf body object*
+// CProtoBufMsg wrapper offsets are resolved by SteamMessageLayout::Resolve and
+// stored in g_messageLayout. Do not hardcode them here.
 
 // g_pJobCur (qword_1397E02C0): current CJob coroutine. CJobID at CJob+32.
 // Only valid on BMainLoop/job thread (yield primitives assert g_pJobCur != NULL).
-static constexpr uintptr_t SC_RVA_JOBCUR_GLOBAL = 0x17E9CC0;
 static constexpr uint32_t  JOB_OFF_JOBID        = 32;
 
 // CJob::BYieldIfTimeSlice (sub_138CE8130): yields if cooperative slice held >10ms.
 //   bool fn(CJob* this, void* ctx, bool* outYielded); asserts this==g_pJobCur.
-static constexpr uintptr_t SC_RVA_YIELD_IF_TIMESLICE = 0xCEF280;
 
 // Schema-fetch injection: send EMsg 818 (schema_local_version=-1) on behalf of
 // an owning SteamID; server replies with 819 -> UserGameStatsSchema_<appid>.bin.
-// RVAs from CAPIJobRequestUserStats (sub_138A45010).
-static constexpr uintptr_t SC_RVA_PBMSG_CTOR      = 0xD1C350;   // CProtoBufMsgBase::ctor(this, emsg, 0) [11.12.30.07]
-static constexpr uintptr_t SC_RVA_PBMSG_FINALIZE  = 0xD21D50;   // allocate typed body [11.12.30.07]
-static constexpr uintptr_t SC_RVA_PBMSG_CLEANUP   = 0xD1C760;   // destroy msg [11.12.30.07]
-static constexpr uintptr_t SC_RVA_GETUSERSTATS_DESC = 0x16F8830; // CMsgClientGetUserStats body descriptor
+// Function addresses come from ScResolver.
 // Typed vtable for CProtoBufMsg<CMsgClientGetUserStats>.
 // Must be at msg[0] after base ctor; base vftable -> serialization crash.
-static constexpr uintptr_t SC_RVA_GETUSERSTATS_VFTABLE = 0x1347988;
 static constexpr uint32_t EMSG_CLIENT_GET_USER_STATS = 818;
 
-// steamclient64.dll RVAs for CCMInterface discovery
-// IDA image base: 0x138000000
-// qword_1397D3628 = global CSteamEngine* pointer
-static constexpr uintptr_t SC_RVA_GLOBAL_ENGINE     = 0x17D3628;
-// CCMInterface vtable RVA (for validation)
-static constexpr uintptr_t SC_RVA_CCMINTERFACE_VT   = 0x1279888;
-// sub_138D022F0 = CNetPacket->CProtoBufNetPacket wrapper
-static constexpr uintptr_t SC_RVA_WRAP_PACKET       = 0xD022F0;
-// sub_138D0DBD0 = CJobMgr::BRouteMsgToJob
-static constexpr uintptr_t SC_RVA_BROUTEMSG         = 0xD0DBD0;
-// sub_1380EC300 = Release wrapped packet (CProtoBufNetPacket ref-count release)
-static constexpr uintptr_t SC_RVA_RELEASE_WRAPPED   = 0x0EC300;
-
-// CClientUnifiedServiceTransport vtable (RTTI resolves at runtime; RVA is fallback)
-static constexpr uintptr_t SC_RVA_SERVICE_TRANSPORT_VT = 0x1256DF0;
-// protobuf ParseFromArray, 3-arg (msgObj, data, int size)
-static constexpr uintptr_t SC_RVA_PARSE_FROM_ARRAY  = 0xBD03F0;
-// sub_138BD0800 = protobuf SerializeToArray (writes body to raw bytes)
-static constexpr uintptr_t SC_RVA_SERIALIZE_TO_ARRAY = 0xBD0800;
-// CUser playtime state helpers
-static constexpr uintptr_t SC_RVA_GET_APP_MINUTES_PLAYED_DATA = 0x9C37A0;
-static constexpr uintptr_t SC_RVA_FLUSH_APP_MINUTES_PLAYED = 0x9D3C40;
-static constexpr uintptr_t SC_RVA_SET_APP_LAST_PLAYED_TIME = 0x9D6A70;
-// Live playtime update: synthesized GetLastPlayedTimes response.
-// Build 1784669098 RVAs:
-static constexpr uintptr_t SC_RVA_PLAYTIME_WRITER    = 0x9CFDA0;
-static constexpr uintptr_t SC_RVA_MSG_CTOR           = 0xD1C350;   // [11.12.30.07]
-static constexpr uintptr_t SC_RVA_MSG_INIT           = 0xD21D50;  // unused; same as PBMSG_FINALIZE
-static constexpr uintptr_t SC_RVA_MSG_DTOR           = 0xD1C760;
-static constexpr uintptr_t SC_RVA_RESP_DESCRIPTOR    = 0x16D5590;
-static constexpr uintptr_t SC_RVA_RESP_WRAPPER_VT    = 0x1334340;
+// All steamclient64 addresses below are resolved at runtime by ScResolver.
+// Function comments describe the scanner target, not a hardcoded RVA.
 // off_1396E8248: pointer to "Software\\Valve\\Steam\\LastPlayedTimesSyncTime"
-static constexpr uintptr_t SC_RVA_REGKEY_SYNCTIME    = 0x16E8248;
 // CUser member offsets used by the writer path
 static constexpr uint32_t USER_OFF_REGISTRY          = 3272;   // CUser+0xCC8: registry obj (sync-time write)
 // Inner CPlayer_GetLastPlayedTimes_Response message offsets
 static constexpr uint32_t RESP_OFF_GAMES_COUNT       = 24;     // repeated games: element count
 static constexpr uint32_t RESP_OFF_GAMES_ARRAY       = 32;     // repeated games: array base ptr
-// CSteamEngine layout offsets
-static constexpr uint32_t ENGINE_OFF_JOBMGR          = 592;    // CJobMgr embedded at CSteamEngine+592
-static constexpr uint32_t ENGINE_OFF_GLOBAL_HANDLE   = 3144;  // uint32_t: global user handle
-static constexpr uint32_t ENGINE_OFF_USER_MAP        = 3296;  // CUtlSortedVector: user map
-// CCMInterface layout offsets
-static constexpr uint32_t CCM_OFF_CONN_CONTEXT       = 1688;  // connection context pointer
-// CUtlSortedVector layout (at engine + ENGINE_OFF_USER_MAP)
-//   +0: QWORD array_base_ptr  (points to array of 16-byte entries)
-//  +16: DWORD count
-// Each entry: { DWORD handle, DWORD pad, QWORD CUser* }
-// CBaseUser layout
-static constexpr uint32_t USER_OFF_CCMINTERFACE     = 72;     // CCMInterface embedded at CBaseUser+0x48
-// Account id in CUser. Resolved at runtime from UserGameStats_%u xref in SaveStatsToDisk.
-// Fallback 570 = build 1782437068 (was 572 on earlier builds).
-static uint32_t USER_OFF_ACCOUNTID = 570;
+// CSteamEngine / CCMInterface / CBaseUser offsets live in
+// ScResolver::ResolvedAddrs and are validated by Compat::BuildStatic before
+// any hook is installed. No build-specific fallback offsets here.
+// Account id in CUser. Resolved at runtime from UserGameStats_%u xref in
+// SaveStatsToDisk. Never fall back to a build-specific offset: 0 means the
+// resolver failed and the cloud gate stays closed.
+static uint32_t USER_OFF_ACCOUNTID = 0;
 
 // Function pointer types for BRouteMsgToJob bypass (Approach D - legacy)
 // sub_138D02530: wraps CNetPacket into CProtoBufNetPacket (parses protobuf header)
@@ -266,11 +206,8 @@ static_assert(offsetof(JobRouteInfo, flags) == 20, "");
 // This function takes rcx = pointer-to-pointer, reads *rcx to get a pointer,
 // then does InterlockedIncrement64 on that second pointer.
 // RecvPkt calls this with &unk_139797BD8 before calling BRouteMsgToJob.
-static constexpr uintptr_t SC_RVA_REFCOUNT_HELPER   = 0xDC2D70;
 // Global that holds the pointer-to-counter for the refcount helper
-static constexpr uintptr_t SC_RVA_REFCOUNT_GLOBAL   = 0x17B7E38;
 // sub_138D28CD0 = CUtlSortedVector::Find (looks up a CJob by jobId)
-static constexpr uintptr_t SC_RVA_FIND_JOB          = 0xD0CDB0;
 
 // SEH exception filter for crash diagnostics
 static thread_local uintptr_t s_crashFaultAddr = 0;
@@ -331,7 +268,8 @@ static uintptr_t g_payloadBase = 0;
 static uintptr_t g_steamClientBase = 0;           // steamclient64.dll base address
 
 // Auto-resolved addresses from steamclient64.dll pattern scanning.
-// Populated once in RunAutoResolver(). Zero = not resolved (use hardcoded fallback).
+// Populated once in RunAutoResolver(). Zero means unresolved; optional paths
+// that need the value stay disabled instead of guessing an offset.
 static ScResolver::ResolvedAddrs g_resolved = {};
 static std::atomic<bool> g_resolverRan{false};
 static SteamMessageLayout::Layout g_messageLayout;
@@ -451,19 +389,30 @@ static std::atomic<bool> g_cloudRedirectEnabled{true};
 // Compatibility gate. Audit is the safe default: no cloud writes and no
 // manifest hooks until the locally verified report (and, optionally, the feed)
 // says full.
-static std::atomic<int> g_compatStatus{static_cast<int>(Compat::Status::Audit)};
+
+static std::atomic<uint32_t> g_compatFeatures{0};
 static Compat::Report g_compatReport;
 static std::mutex g_compatMutex;
+static std::mutex g_compatNotifyMutex;
 static std::string g_compatSha;
 static bool g_compatFeedEnabled = true;
-static bool g_compatFeedStrict = false;
+static bool g_compatFeedStrict = true;
 static std::vector<std::string> g_compatFeedUrls;
 static bool g_accountIdResolved = false;
 
-bool IsCompatFull() {
-    return g_compatStatus.load(std::memory_order_acquire) ==
-           static_cast<int>(Compat::Status::Full);
+static bool FeatureEnabled(Compat::Feature feature) {
+    return (g_compatFeatures.load(std::memory_order_acquire) &
+            static_cast<uint32_t>(feature)) != 0;
 }
+
+bool IsCompatFull() {
+    // Cloud is the master feature: a cloud failure disables everything.
+    return FeatureEnabled(Compat::kCloud);
+}
+
+static bool IsManifestCompat() { return FeatureEnabled(Compat::kManifest); }
+static bool IsPlaytimeCompat() { return FeatureEnabled(Compat::kPlaytime); }
+static bool IsKvCompat() { return FeatureEnabled(Compat::kKv); }
 
 static bool CloudGateOpen() {
     return g_cloudRedirectEnabled.load(std::memory_order_relaxed) && IsCompatFull();
@@ -521,19 +470,71 @@ static void EvaluateCompat(bool feedPresent, Compat::Status feedStatus) {
     local.steamVersion = g_detectedSteamVersion.load(std::memory_order_relaxed);
     local.sha256 = g_compatSha;
     local.tool = "CloudRedirect/" CR_RELEASE_VERSION;
+    local.dllVersion = CR_RELEASE_VERSION;
+    local.allowlisted = Compat::IsAllowlisted(g_compatSha);
+
+    uint32_t featureMask = 0;
     if (g_compatSha.empty()) {
         local.status = Compat::Status::Audit;
+        local.subsystems = {};
         local.reasons.push_back("steamclient_sha256");
     } else {
-        local.status = Compat::Decide(local, feedPresent, feedStatus, g_compatFeedStrict);
+        local.status = Compat::Decide(local, feedPresent, feedStatus,
+                                      g_compatFeedStrict, local.allowlisted);
+        const Compat::Subsystems features = Compat::DecideSubsystems(
+            local, feedPresent, feedStatus, g_compatFeedStrict,
+            local.allowlisted);
+        if (features.cloud) featureMask |= Compat::kCloud;
+        if (features.manifest) featureMask |= Compat::kManifest;
+        if (features.playtime) featureMask |= Compat::kPlaytime;
+        if (features.kv) featureMask |= Compat::kKv;
     }
 
     g_compatReport = local;
-    g_compatStatus.store(static_cast<int>(local.status), std::memory_order_release);
+    g_compatFeatures.store(featureMask, std::memory_order_release);
     WriteCompatJsonLocked();
 
-    LOG("[Compat] status=%s sha=%s missing=%zu", Compat::StatusName(local.status),
-        g_compatSha.c_str(), local.reasons.size());
+    LOG("[Compat] status=%s cloud=%d manifest=%d playtime=%d kv=%d allowlisted=%d sha=%s missing=%zu",
+        Compat::StatusName(local.status),
+        (featureMask & Compat::kCloud) != 0,
+        (featureMask & Compat::kManifest) != 0,
+        (featureMask & Compat::kPlaytime) != 0,
+        (featureMask & Compat::kKv) != 0,
+        local.allowlisted ? 1 : 0, g_compatSha.c_str(), local.reasons.size());
+}
+
+// Show one warning per steamclient hash. The marker lives next to compat.json
+// so a successful feed update does not nag the user on every launch.
+static void NotifyCompatOnce() {
+    Compat::Report report;
+    {
+        std::lock_guard<std::mutex> lock(g_compatMutex);
+        report = g_compatReport;
+    }
+    if (report.status == Compat::Status::Full) return;
+    if (!g_cloudRedirectEnabled.load(std::memory_order_relaxed)) return;
+    if (g_steamPath.empty() || g_compatSha.empty()) return;
+
+    std::lock_guard<std::mutex> notifyLock(g_compatNotifyMutex);
+    const std::string markerPath =
+        g_steamPath + "cloud_redirect\\compat_notified.txt";
+    {
+        std::ifstream marker(FileUtil::Utf8ToPath(markerPath));
+        std::string last;
+        if (marker && std::getline(marker, last) && last == g_compatSha) return;
+    }
+    FileUtil::AtomicWriteText(markerPath, g_compatSha + "\n");
+
+    char message[768];
+    std::snprintf(message, sizeof(message),
+        "CloudRedirect is in compatibility audit mode for this Steam build.\n\n"
+        "Build: %llu\nSteamclient: %.12s...\nStatus: %s\n\n"
+        "Cloud writes are paused in safe mode; Steam's native cloud is "
+        "unaffected. See cloud_redirect\\compat.json for details.",
+        static_cast<unsigned long long>(report.steamVersion),
+        g_compatSha.c_str(), Compat::StatusName(report.status));
+    LOG("[Compat] audit notice: %s", message);
+    NotifyUser(CR_NOTIFY_WARN, "CloudRedirect - compatibility audit", message);
 }
 
 static void StartCompatFeedFetch() {
@@ -550,6 +551,7 @@ static void StartCompatFeedFetch() {
         if (!result.fromCache)
             CompatFeed::SaveCache(g_steamPath, sha, result.body);
         EvaluateCompat(true, result.status);
+        NotifyCompatOnce();
     });
     std::lock_guard<std::mutex> lock(g_bgThreadsMutex);
     g_bgThreads.push_back(std::move(worker));
@@ -824,6 +826,7 @@ static uint32_t ScanUserAccountIdOffset() {
 
 // Read account id from CUser when no RPC header is available yet. SEH-isolated.
 static uint32_t ReadAccountIdFromUser() {
+    if (!USER_OFF_ACCOUNTID) return 0;
     uintptr_t user = FindCurrentUser();
     if (!user) return 0;
     uint32_t acct = 0;
@@ -1070,23 +1073,51 @@ static std::vector<uint8_t> BuildPacket(uint32_t emsg, const PB::Writer& header,
     return pkt;
 }
 
-// CCMInterface discovery: CSteamEngine* -> engine+3144 (handle) -> engine+3296
-// (user map) -> matching CUser* -> CUser+72 (CCMInterface embedded).
+// CCMInterface discovery: CSteamEngine* -> engine user map -> matching CUser*
+// -> embedded CCMInterface. The CUser offset comes from the resolver when it
+// can prove it; otherwise we locate the embedded CCMInterface vtable inside
+// the live CUser object. No build-specific offset is assumed.
+static uint32_t DiscoverUserCcmOffset(uintptr_t userPtr, uintptr_t expectedVtable) {
+    if (!userPtr || !expectedVtable) return 0;
+    constexpr size_t kMaxScan = 0x4000;
+    __try {
+        for (size_t off = 0; off + sizeof(void*) <= kMaxScan;
+             off += sizeof(void*)) {
+            if (*reinterpret_cast<uintptr_t*>(userPtr + off) == expectedVtable) {
+                return static_cast<uint32_t>(off);
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+    return 0;
+}
+
 static void* FindCCMInterface() {
     uintptr_t userPtr = FindCurrentUser();
     if (!userPtr) return nullptr;
 
-    // CCMInterface is embedded at CBaseUser+72 (0x48)
-    uintptr_t ccm = userPtr + USER_OFF_CCMINTERFACE;
-
-    // Validate by checking vtable matches CCMInterface::vftable
     uintptr_t expectedVtable = SC_RESOLVE(ccmInterfaceVtable);
     if (!expectedVtable) return nullptr;
+
+    uint32_t ccmOffset = g_resolved.userOffCcmInterface;
+    if (!ccmOffset) {
+        ccmOffset = DiscoverUserCcmOffset(userPtr, expectedVtable);
+        if (ccmOffset) {
+            g_resolved.userOffCcmInterface = ccmOffset;
+            LOG("[CCM] Discovered CUser->CCMInterface offset = 0x%X", ccmOffset);
+        }
+    }
+    if (!ccmOffset) return nullptr;
+    uintptr_t ccm = userPtr + ccmOffset;
+
+    // Validate by checking vtable matches CCMInterface::vftable
     uintptr_t actualVtable = 0;
     __try { actualVtable = *(uintptr_t*)ccm; } __except(EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
 
     if (actualVtable != expectedVtable) {
-        LOG("[CCM] Vtable mismatch at CUser+72: expected=%p actual=%p", 
+        LOG("[CCM] Vtable mismatch at CUser+%u: expected=%p actual=%p",
+            g_resolved.userOffCcmInterface,
             (void*)expectedVtable, (void*)actualVtable);
         return nullptr;
     }
@@ -1118,10 +1149,12 @@ static void TryFindCCMInterface() {
         uintptr_t engine = *pEngineGlobal;
         uint32_t handle = *(uint32_t*)(engine + g_resolved.engineOffGlobalHandle);
 
-        LOG("[CCM]   CSteamEngine: %p (global at sc+0x%X)", (void*)engine, SC_RVA_GLOBAL_ENGINE);
+        LOG("[CCM]   CSteamEngine: %p (global at sc+0x%llX)", (void*)engine,
+            (unsigned long long)((uintptr_t)pEngineGlobal - g_steamClientBase));
         LOG("[CCM]   Global user handle: %u", handle);
         LOG("[CCM]   Vtable: %p (RVA=0x%llX) -- MATCHES CCMInterface::vftable",
-            (void*)(*(uintptr_t*)ccm), (uint64_t)SC_RVA_CCMINTERFACE_VT);
+            (void*)(*(uintptr_t*)ccm),
+            (unsigned long long)(g_resolved.ccmInterfaceVtable - g_steamClientBase));
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         LOG("[CCM] WARNING: exception reading engine globals (code=0x%lX)", GetExceptionCode());
     }
@@ -1141,9 +1174,11 @@ static void TryFindCCMInterface() {
             g_refCountHelper, g_refCountGlobalPtr,
             g_refCountGlobalPtr ? (void*)*g_refCountGlobalPtr : nullptr);
         uintptr_t engine = *(uintptr_t*)SC_RESOLVE(globalEngine);
+        uint32_t jobMgrOff = g_resolved.engineOffJobMgr;
+        uint32_t connOff = g_resolved.ccmOffConnContext;
         LOG("[CCM]   CJobMgr (engine+%u)=%p  ConnCtx (ccm+%u)=%p",
-            ENGINE_OFF_JOBMGR, (void*)(engine + ENGINE_OFF_JOBMGR),
-            CCM_OFF_CONN_CONTEXT, *(void**)((uintptr_t)ccm + CCM_OFF_CONN_CONTEXT));
+            jobMgrOff, jobMgrOff ? (void*)(engine + jobMgrOff) : nullptr,
+            connOff, connOff ? *(void**)((uintptr_t)ccm + connOff) : nullptr);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         LOG("[CCM] WARNING: exception during extended diagnostics (code=0x%lX)", GetExceptionCode());
     }
@@ -1324,11 +1359,18 @@ static void ProcessQueuedInjection(QueuedInjection* ctx) {
     // Get CJobMgr and connection context (SEH-protected like FindCCMInterface)
     void* jobMgr = nullptr;
     void* connCtx = nullptr;
+    if (!g_resolved.engineOffJobMgr || !g_resolved.ccmOffConnContext) {
+        LOG("[INJECT]   resolver missing engineOffJobMgr/ccmOffConnContext");
+        __try { g_releaseWrapped(wrappedPkt); } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        VirtualFree(ctx->pktBuf, 0, MEM_RELEASE);
+        delete ctx;
+        return;
+    }
     __try {
         uintptr_t* pEngineGlobal = (uintptr_t*)SC_RESOLVE(globalEngine);
         uintptr_t engine = *pEngineGlobal;
-        jobMgr = (void*)(engine + ENGINE_OFF_JOBMGR);
-        connCtx = *(void**)((uintptr_t)g_cmInterface.load(std::memory_order_acquire) + CCM_OFF_CONN_CONTEXT);
+        jobMgr = (void*)(engine + g_resolved.engineOffJobMgr);
+        connCtx = *(void**)((uintptr_t)g_cmInterface.load(std::memory_order_acquire) + g_resolved.ccmOffConnContext);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         LOG("[INJECT]   EXCEPTION reading engine/connCtx: code=0x%08X", GetExceptionCode());
         __try { g_releaseWrapped(wrappedPkt); } __except(EXCEPTION_EXECUTE_HANDLER) {}
@@ -2736,6 +2778,10 @@ static std::mutex& GetInstallMutex() {
 
 // Install the vtable hook on CClientUnifiedServiceTransport
 void InstallServiceMethodHook() {
+    if (!IsCompatFull()) {
+        LOG("[VtHook] cloud subsystem not full, skipping service-method hook");
+        return;
+    }
     // Serialize concurrent installers (network thread + lua-sync thread)
     // so a partial installer can't have its own hook read back as the original.
     std::lock_guard<std::mutex> installLock(GetInstallMutex());
@@ -4298,7 +4344,8 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
 
     // Run auto-resolver: resolves steamclient64 function/global addresses via
     // pattern scanning, RTTI walks, and string xrefs. Must run before any hooks
-    // or function-pointer resolution. Falls back to hardcoded RVAs on failure.
+    // or function-pointer resolution. Failure leaves addresses at zero and the
+    // compatibility report fails closed; there are no build-specific RVAs.
     RunAutoResolver();
 
     // Resolve CUser::accountId offset. No blind 570 fallback: an unresolved
@@ -4505,14 +4552,9 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
 
     LOG("cloud_redirect=%d", g_cloudRedirectEnabled.load());
 
-    if (!g_cloudRedirectEnabled.load()) {
-        LOG("Cloud redirection disabled, skipping cloud init");
-        LOG("CloudIntercept initialized (manifest pinning only), steam=%s", g_steamPath.c_str());
-        return;
-    }
-
     // Apply the cached compatibility feed (if any), then refresh it in the
-    // background. The gate stays closed until the local report is full.
+    // background. This runs even with cloud redirection disabled so manifest
+    // pinning gets its own verdict instead of inheriting the cloud default.
     {
         CompatFeed::Result cached;
         if (g_compatFeedEnabled && !g_compatSha.empty())
@@ -4521,6 +4563,14 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
         if (g_compatFeedEnabled)
             StartCompatFeedFetch();
     }
+
+    if (!g_cloudRedirectEnabled.load()) {
+        LOG("Cloud redirection disabled, skipping cloud init");
+        LOG("CloudIntercept initialized (manifest pinning only), steam=%s", g_steamPath.c_str());
+        return;
+    }
+
+    NotifyCompatOnce();
 
     if (!IsCompatFull()) {
         LOG("[Compat] audit mode: cloud init skipped, no writes will be attempted");
@@ -4955,7 +5005,7 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
         ? (MetadataSync::syncAchievements.load(std::memory_order_relaxed) ||
            MetadataSync::syncPlaytime.load(std::memory_order_relaxed))
         : (MetadataSync::AchievementsEnabled() || MetadataSync::PlaytimeEnabled());
-    if (shouldSeed) {
+    if (shouldSeed && IsPlaytimeCompat()) {
         if (cloudSaveOnly) {
             // Third-party: apps aren't registered yet (CR_SetApps comes after Init).
             // Defer seeding â€” CR_SetApps calls TriggerDeferredSeed once apps arrive.
@@ -4974,7 +5024,7 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
     }
 
     // Poll cloud for remote playtime advances; enqueue for net-thread to apply.
-    {
+    if (IsPlaytimeCompat()) {
         std::thread poller([] {
             for (;;) {
                 for (int i = 0; i < 60 && !g_shuttingDown.load(); ++i)
@@ -5001,7 +5051,11 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
             g_bgThreads.push_back(std::move(poller));
     }
 
-    SteamKvInjector::Init();
+    if (IsKvCompat()) {
+        SteamKvInjector::Init();
+    } else {
+        LOG("[KV] kv subsystem not full, skipping injector init");
+    }
 
 
     if (g_syncLuas) {
@@ -5119,8 +5173,8 @@ void InstallRecvPktDetour() {
 }
 
 void InstallManifestPinHook() {
-    if (!IsCompatFull()) {
-        LOG("[ManifestPin] compat audit mode, skipping hook");
+    if (!IsManifestCompat()) {
+        LOG("[ManifestPin] manifest subsystem not full, skipping hook");
         return;
     }
     if (!g_manifestPinsEnabled.load(std::memory_order_relaxed)) {
@@ -5231,8 +5285,8 @@ static uint8_t  g_releaseStateOrig[6] = {};
 static std::atomic<bool> g_releaseStatePatched{false};
 
 void InstallReleaseStateNop() {
-    if (!IsCompatFull()) {
-        LOG("[Compat] audit mode, skipping release-state patch");
+    if (!IsManifestCompat()) {
+        LOG("[Compat] manifest subsystem not full, skipping release-state patch");
         return;
     }
     // Patch GetEffectiveReleaseState to always return 4 (RELEASED).
@@ -5390,83 +5444,135 @@ static const uint8_t kP8bMask[] = {
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
 };
 
+namespace {
+
+struct SteamSection {
+    uintptr_t base = 0;
+    size_t size = 0;
+};
+
+bool FindSteamClientSection(const char* name, SteamSection& out) {
+    out = {};
+    HMODULE module = GetModuleHandleA("steamclient64.dll");
+    if (!module) return false;
+    const auto* image = reinterpret_cast<const uint8_t*>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+        image + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        return false;
+    }
+
+    const size_t imageSize = nt->OptionalHeader.SizeOfImage;
+    const auto* section = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+        if (std::strncmp(reinterpret_cast<const char*>(section->Name),
+                         name, IMAGE_SIZEOF_SHORT_NAME) != 0) {
+            continue;
+        }
+        const size_t va = section->VirtualAddress;
+        if (va >= imageSize) return false;
+        size_t size = section->Misc.VirtualSize;
+        if (!size) size = section->SizeOfRawData;
+        if (size > imageSize - va) size = imageSize - va;
+        if (!size) return false;
+        out.base = reinterpret_cast<uintptr_t>(image) + va;
+        out.size = size;
+        return true;
+    }
+    return false;
+}
+
+} // namespace
+
 void InstallManifestEndpointOverride() {
-    if (!IsCompatFull()) {
-        LOG("[ManifestEP] compat audit mode, skipping");
+    if (!IsManifestCompat()) {
+        LOG("[ManifestEP] manifest subsystem not full, skipping");
         return;
     }
     if (g_manifestEndpoint.empty()) {
         LOG("[ManifestEP] No endpoint configured, skipping");
         return;
     }
-    if (!g_payloadBase) {
-        LOG("[ManifestEP] Payload base unknown, skipping");
+
+    HMODULE module = GetModuleHandleA("steamclient64.dll");
+    if (!module) {
+        LOG("[ManifestEP] steamclient64.dll not mapped, skipping");
         return;
     }
+    g_steamClientBase = reinterpret_cast<uintptr_t>(module);
+    g_payloadBase = g_steamClientBase;
 
-    // Hardcoded section layout (page 0 not mapped, no PE header access).
-    static constexpr uintptr_t kTextRva   = 0x1000;
-    static constexpr size_t    kTextSize  = 0x178000;
-    static constexpr uintptr_t kRdataRva  = 0x179000;
-    static constexpr size_t    kRdataSize = 0x54000;
-
-    uintptr_t textBase = g_payloadBase + kTextRva;
-    size_t textSize = kTextSize;
-    uintptr_t rdataBase = g_payloadBase + kRdataRva;
-    size_t rdataSize = kRdataSize;
-
-    __try {
-        volatile uint8_t probe = *reinterpret_cast<uint8_t*>(textBase);
-        (void)probe;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        LOG("[ManifestEP] .text base not readable at %p", (void*)textBase);
+    SteamSection text;
+    SteamSection rdata;
+    if (!FindSteamClientSection(".text", text) ||
+        !FindSteamClientSection(".rdata", rdata)) {
+        LOG("[ManifestEP] PE sections not found, skipping");
         return;
     }
 
     uintptr_t p8bAddr = 0;
     __try {
-        const auto* p = reinterpret_cast<const uint8_t*>(textBase);
-        for (size_t i = 0; i + sizeof(kP8bSig) <= textSize; ++i) {
+        const auto* p = reinterpret_cast<const uint8_t*>(text.base);
+        for (size_t i = 0; i + sizeof(kP8bSig) <= text.size; ++i) {
             bool match = true;
             for (size_t j = 0; j < sizeof(kP8bSig); ++j) {
                 if ((p[i + j] & kP8bMask[j]) != (kP8bSig[j] & kP8bMask[j])) {
                     match = false; break;
                 }
             }
-            if (match) { p8bAddr = textBase + i; break; }
+            if (match) { p8bAddr = text.base + i; break; }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 
-    if (!p8bAddr) {
-        LOG("[ManifestEP] P8b signature not found in payload .text"); return;
+    if (!p8bAddr || p8bAddr + 41 > text.base + text.size) {
+        LOG("[ManifestEP] P8b signature not found (or outside .text)"); return;
     }
-    LOG("[ManifestEP] P8b at %p (payload+0x%llX)",
-        (void*)p8bAddr, (unsigned long long)(p8bAddr - g_payloadBase));
+    LOG("[ManifestEP] P8b at %p (steamclient+0x%llX)",
+        (void*)p8bAddr, (unsigned long long)(p8bAddr - g_steamClientBase));
 
-    // URL lea rdx,[rip+xx] is 355 bytes before P8b (function+108 vs +463).
-    uintptr_t urlLeaAddr = p8bAddr - 355;
+    // Find the nearest `lea rdx,[rip+disp]` before P8b whose target is an
+    // http(s) string in .rdata. This replaces the old fixed -355 offset.
+    uintptr_t urlLeaAddr = 0;
     __try {
-        if (*(uint8_t*)urlLeaAddr != 0x48 || *(uint8_t*)(urlLeaAddr + 1) != 0x8D ||
-            *(uint8_t*)(urlLeaAddr + 2) != 0x15) {
-            LOG("[ManifestEP] URL lea not found at expected offset (got %02X %02X %02X)",
-                *(uint8_t*)urlLeaAddr, *(uint8_t*)(urlLeaAddr + 1), *(uint8_t*)(urlLeaAddr + 2));
-            return;
+        const size_t beforeP8b = p8bAddr - text.base;
+        const size_t maxBack = beforeP8b < 1024 ? beforeP8b : 1024;
+        for (size_t back = 3; back + 7 <= maxBack; ++back) {
+            const uintptr_t candidate = p8bAddr - back;
+            const auto* code = reinterpret_cast<const uint8_t*>(candidate);
+            if (code[0] != 0x48 || code[1] != 0x8D || code[2] != 0x15) continue;
+            const int32_t disp = *reinterpret_cast<const int32_t*>(code + 3);
+            const uintptr_t target = candidate + 7 + disp;
+            if (target < rdata.base || target + 4 > rdata.base + rdata.size)
+                continue;
+            if (std::memcmp(reinterpret_cast<const void*>(target), "http", 4) != 0)
+                continue;
+            urlLeaAddr = candidate;
+            break;
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        LOG("[ManifestEP] Access violation reading URL lea at %p", (void*)urlLeaAddr);
+        LOG("[ManifestEP] Access violation while scanning for URL lea");
         return;
     }
 
-    int32_t origUrlDisp = *(int32_t*)(urlLeaAddr + 3);
-    uintptr_t origUrlTarget = urlLeaAddr + 7 + origUrlDisp;
-    if (origUrlTarget < rdataBase || origUrlTarget >= rdataBase + rdataSize) {
-        LOG("[ManifestEP] URL lea target %p outside expected .rdata range, proceeding anyway",
-            (void*)origUrlTarget);
+    if (!urlLeaAddr) {
+        LOG("[ManifestEP] No http URL lea found before P8b, skipping");
+        return;
     }
-    const char* origUrl = nullptr;
+
+    const int32_t origUrlDisp =
+        *reinterpret_cast<const int32_t*>(urlLeaAddr + 3);
+    const uintptr_t origUrlTarget = urlLeaAddr + 7 + origUrlDisp;
+    if (origUrlTarget < rdata.base || origUrlTarget + 4 > rdata.base + rdata.size) {
+        LOG("[ManifestEP] URL lea target %p outside .rdata, skipping",
+            (void*)origUrlTarget);
+        return;
+    }
+    const char* origUrl = reinterpret_cast<const char*>(origUrlTarget);
     __try {
-        origUrl = reinterpret_cast<const char*>(origUrlTarget);
-        if (strncmp(origUrl, "http", 4) != 0) {
+        if (std::strncmp(origUrl, "http", 4) != 0) {
             LOG("[ManifestEP] URL lea target doesn't start with 'http': %.32s", origUrl);
             return;
         }
@@ -5652,7 +5758,9 @@ static void SweepNamespaceSchemas();  // fwd decl
 // Schedule schema sweep once after startup settles (injecting during startup hangs client).
 static std::atomic<bool> g_schemaSweepScheduled{false};
 static void MaybeScheduleSchemaSweep() {
-    // Experimental opt-in: only fetch schemas when the user enabled it.
+    // Experimental opt-in: only fetch schemas when the user enabled it and the
+    // playtime/message subsystem passed its local checks.
+    if (!IsPlaytimeCompat()) return;
     if (!MetadataSync::SchemaFetchEnabled()) return;
     if (g_schemaSweepScheduled.exchange(true)) return;   // once per session
     std::thread t([] {
@@ -5675,14 +5783,14 @@ static uint8_t __fastcall BAsyncSendHook(void* pMsg, uint32_t connHandle) {
     // Capture CM connection handle for schema-fetch injection.
     if (connHandle && pMsg) {
         // Prefer the conn from Steam's own GetUserStats (818 -> 819 reply path).
-        uint32_t hookEmsg = *(uint32_t*)((uintptr_t)pMsg + CPROTOBUFMSG_OFF_EMSG) & EMSG_MASK;
+        uint32_t hookEmsg = *(uint32_t*)((uintptr_t)pMsg + g_messageLayout.emsg) & EMSG_MASK;
         if (hookEmsg == EMSG_CLIENT_GET_USER_STATS) {
             if (g_statsConnHandle.exchange(connHandle, std::memory_order_relaxed) != connHandle)
                 LOG("[Schema] captured CM conn=%u from Steam's own GetUserStats", connHandle);
         }
         // Capture session fields from any outgoing message for injected 818s.
         if (!g_hdrCaptured.load(std::memory_order_relaxed)) {
-            void* ownHdr = *(void**)((uintptr_t)pMsg + CPROTOBUFMSG_OFF_HDR);
+            void* ownHdr = *(void**)((uintptr_t)pMsg + g_messageLayout.hdr);
             if (ownHdr) {
                 uint8_t* hb = (uint8_t*)ownHdr;
                 uint64_t sid = *(uint64_t*)(hb + 104);
@@ -5703,14 +5811,14 @@ static uint8_t __fastcall BAsyncSendHook(void* pMsg, uint32_t connHandle) {
         MaybeScheduleSchemaSweep();
     }
     if (HasNamespaceApps() && pMsg && g_serializeToArray && g_parseFromArray) {
-        uint32_t emsgRaw = *(uint32_t*)((uintptr_t)pMsg + CPROTOBUFMSG_OFF_EMSG);
+        uint32_t emsgRaw = *(uint32_t*)((uintptr_t)pMsg + g_messageLayout.emsg);
         uint32_t emsg = emsgRaw & EMSG_MASK;
 
         if (emsg == EMSG_CLIENT_GAMES_PLAYED ||
             emsg == EMSG_CLIENT_GAMES_PLAYED_NO_DATABLOB ||
             emsg == EMSG_CLIENT_GAMES_PLAYED_WITH_DATABLOB) {
 
-            void* bodyObj = *(void**)((uintptr_t)pMsg + CPROTOBUFMSG_OFF_BODY);
+            void* bodyObj = *(void**)((uintptr_t)pMsg + g_messageLayout.body);
             if (bodyObj) {
                 // Observe games-played for playtime session tracking (gated by sync_playtime).
                 if (MetadataSync::PlaytimeEnabled()) {
@@ -5732,7 +5840,7 @@ static uint8_t __fastcall BAsyncSendHook(void* pMsg, uint32_t connHandle) {
         else if (emsg == EMSG_CLIENT_STORE_USER_STATS2 &&
                  MetadataSync::AchievementsEnabled()) {
             // Client sends on achievement/stat unlock. Re-read native blob to sync new unlocks.
-            void* bodyObj = *(void**)((uintptr_t)pMsg + CPROTOBUFMSG_OFF_BODY);
+            void* bodyObj = *(void**)((uintptr_t)pMsg + g_messageLayout.body);
             if (bodyObj) {
                 auto observeBytes = SerializeBodyToBytes(bodyObj);
                 if (!observeBytes.empty()) {
@@ -5745,7 +5853,7 @@ static uint8_t __fastcall BAsyncSendHook(void* pMsg, uint32_t connHandle) {
         else if (emsg == EMSG_CLIENT_GET_USER_STATS &&
                  MetadataSync::AchievementsEnabled()) {
             // Namespace apps: inject our 819 and suppress 818 to prevent CM clobbering.
-            void* bodyObj = *(void**)((uintptr_t)pMsg + CPROTOBUFMSG_OFF_BODY);
+            void* bodyObj = *(void**)((uintptr_t)pMsg + g_messageLayout.body);
             if (bodyObj) {
                 auto reqBytes = SerializeBodyToBytes(bodyObj);
                 if (!reqBytes.empty()) {
@@ -6094,16 +6202,23 @@ static bool SendSchemaRequest(uint32_t appId, uint64_t ownerId, uint32_t connHan
     if (!g_pbMsgCtor || !g_pbMsgFinalize || !g_pbMsgCleanup ||
         !g_getUserStatsDesc || !g_getUserStatsVtbl || !g_parseFromArray)
         return false;
+    // desc/conn are only known for the verified 0x30 layout. An older/newer
+    // wrapper shape disables schema injection instead of writing at a guessed
+    // offset.
+    if (!g_messageLayout.desc || !g_messageLayout.conn) {
+        LOG("[Schema] wrapper desc/conn offsets unknown; schema request skipped");
+        return false;
+    }
 
     // Replicate CProtoBufMsg<CMsgClientGetUserStats> construction (sub_138A44F70).
     // Typed vftable mandatory: base vftable -> malformed wire -> crash.
     alignas(16) uint8_t msg[128] = {0};
     g_pbMsgCtor(msg, (int)EMSG_CLIENT_GET_USER_STATS, 0);     // base ctor: emsg=818
     *(void**)(msg + 0) = g_getUserStatsVtbl;                  // install typed vftable
-    *(void**)(msg + CPROTOBUFMSG_OFF_DESC) = g_getUserStatsDesc; // typed-body descriptor
-    g_pbMsgFinalize(msg);                                      // allocate body at +0x38
+    *(void**)(msg + g_messageLayout.desc) = g_getUserStatsDesc; // typed-body descriptor
+    g_pbMsgFinalize(msg);                                      // allocate body
 
-    void* body = *(void**)(msg + CPROTOBUFMSG_OFF_BODY);
+    void* body = *(void**)(msg + g_messageLayout.body);
     if (!body) { g_pbMsgCleanup(msg); return false; }
 
     // Header requirements:
@@ -6111,7 +6226,7 @@ static bool SendSchemaRequest(uint32_t appId, uint64_t ownerId, uint32_t connHan
     //  2. Session fields (steamid, sessionid, realm, jobid_source): CM drops without.
     // Offsets: +104 steamid, +112 sessionid, +156 realm, +208 jobid_source
     static std::atomic<uint64_t> s_jobIdCounter{0x5C00000000000001ull};
-    if (void* hdr = *(void**)(msg + CPROTOBUFMSG_OFF_HDR)) {
+    if (void* hdr = *(void**)(msg + g_messageLayout.hdr)) {
         uint8_t* h = (uint8_t*)hdr;
         *(int32_t*)(h + 192) = -1;                         // expiry = -1 (no deadline)
         *(uint32_t*)(h + 16) &= ~0x4000000u;               // clear "no reply expected"
@@ -6137,7 +6252,7 @@ static bool SendSchemaRequest(uint32_t appId, uint64_t ownerId, uint32_t connHan
     bool ok = ParseBytesToBody(body, w.Data().data(), w.Size());
     if (!ok) { g_pbMsgCleanup(msg); return false; }
 
-    *(uint32_t*)(msg + CPROTOBUFMSG_OFF_CONN) = connHandle;
+    *(uint32_t*)(msg + g_messageLayout.conn) = connHandle;
 
     // The 819 response is correlated by game_id (appid); see TryHandleSchemaResponse.
     auto basend = reinterpret_cast<BAsyncSendFn>(g_basOriginal);
@@ -6398,8 +6513,8 @@ static void SweepNamespaceSchemas() {
 }
 
 void InstallGamesPlayedHook() {
-    if (!IsCompatFull()) {
-        LOG("[GamesPlayed] compat audit mode, skipping hook");
+    if (!IsPlaytimeCompat()) {
+        LOG("[GamesPlayed] playtime subsystem not full, skipping hook");
         return;
     }
     if (!HasNamespaceApps()) return;
@@ -6486,8 +6601,28 @@ void SetSendPktAddr(void* recvPktGlobalAddr) {
         return;
     }
 
-    g_payloadBase = (uintptr_t)recvPktGlobalAddr - RVA_RECV_PKT_GLOBAL;
-    LOG("[NS] payload_base=%p", (void*)g_payloadBase);
+    HMODULE module = GetModuleHandleA("steamclient64.dll");
+    if (!module) {
+        LOG("[NS] SetSendPktAddr: steamclient64.dll not mapped");
+        return;
+    }
+    MODULEINFO info{};
+    if (!GetModuleInformation(GetCurrentProcess(), module, &info, sizeof(info))) {
+        LOG("[NS] SetSendPktAddr: GetModuleInformation failed (%u)", GetLastError());
+        return;
+    }
+    const uintptr_t base = reinterpret_cast<uintptr_t>(module);
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(recvPktGlobalAddr);
+    if (addr < base || addr >= base + info.SizeOfImage) {
+        LOG("[NS] SetSendPktAddr: recvPkt=%p outside steamclient image [%p,%p)",
+            recvPktGlobalAddr, (void*)base, (void*)(base + info.SizeOfImage));
+        return;
+    }
+
+    g_steamClientBase = base;
+    g_payloadBase = base;
+    LOG("[NS] payload_base=%p (module base; recvPkt=%p)",
+        (void*)g_payloadBase, recvPktGlobalAddr);
 }
 
 // â”€â”€ GamesPlayed rewriting â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€

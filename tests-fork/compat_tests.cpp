@@ -22,6 +22,7 @@ void Check(bool condition, const char* message) {
 Compat::Report LocalFull() {
     Compat::Report report;
     report.status = Compat::Status::Full;
+    report.subsystems = {true, true, true, true};
     return report;
 }
 
@@ -39,9 +40,36 @@ int main() {
     Check(Compat::Decide(LocalFull(), false, Status::Audit, false) == Status::Full,
           "local full, no feed, lenient");
     Check(Compat::Decide(LocalFull(), false, Status::Audit, true) == Status::Unverified,
-          "local full, no feed, strict");
+          "local full, no feed, strict, not allowlisted");
+    Check(Compat::Decide(LocalFull(), false, Status::Audit, true, true) == Status::Full,
+          "local full, no feed, strict, allowlisted");
     Check(Compat::Decide(LocalFull(), true, Status::Full, true) == Status::Full,
           "local full, feed full");
+    Check(Compat::IsAllowlisted(
+              "e9045710ec7ee47d7b7488d1c5dda2d933dec7e251e965967a5c48f4df68eb4e"),
+          "previous steamclient hash allowlisted");
+    Check(Compat::IsAllowlisted(
+              "253e0a11a4415b38c78a42f7bdd6ecc426455f06c1ba6453a48090df3142dbbc"),
+          "current steamclient hash allowlisted");
+    Check(!Compat::IsAllowlisted("deadbeef"), "unknown hash not allowlisted");
+
+    const Compat::Subsystems all = Compat::DecideSubsystems(
+        LocalFull(), false, Status::Audit, true, true);
+    Check(all.All(), "allowlisted strict enables all subsystems");
+    const Compat::Subsystems none = Compat::DecideSubsystems(
+        LocalFull(), false, Status::Audit, true, false);
+    Check(none.None(), "unknown strict build disables all subsystems");
+    const Compat::Subsystems feedAudit = Compat::DecideSubsystems(
+        LocalFull(), true, Status::Audit, false, true);
+    Check(feedAudit.None(), "feed audit disables all subsystems");
+
+    Compat::Report partial = LocalFull();
+    partial.subsystems.manifest = false;
+    const Compat::Subsystems partialResult = Compat::DecideSubsystems(
+        partial, false, Status::Audit, true, true);
+    Check(partialResult.cloud && !partialResult.manifest &&
+              partialResult.playtime && partialResult.kv,
+          "manifest failure disables only manifest");
     Check(Compat::Decide(LocalFull(), true, Status::Audit, false) == Status::Audit,
           "feed audit wins");
     Check(Compat::Decide(LocalFull(), true, Status::Blocked, false) == Status::Blocked,
@@ -58,6 +86,15 @@ int main() {
     const std::string json = Compat::ToJson(report);
     Check(json.find("\"status\":\"full\"") != std::string::npos, "json status");
     Check(json.find("\"schema\":1") != std::string::npos, "json schema");
+    Check(json.find("\"subsystems\":{") != std::string::npos,
+          "json subsystems object");
+    Check(json.find("\"cloud\":true") != std::string::npos &&
+              json.find("\"manifest\":true") != std::string::npos &&
+              json.find("\"playtime\":true") != std::string::npos &&
+              json.find("\"kv\":true") != std::string::npos,
+          "json subsystems all true");
+    Check(json.find("\"allowlisted\":false") != std::string::npos,
+          "json allowlisted");
 
     if (g_failures) {
         std::fprintf(stderr, "compat_tests: %d failure(s)\n", g_failures);

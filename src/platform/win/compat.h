@@ -24,9 +24,33 @@ enum class Status {
     Blocked,
 };
 
+// Feature bits carried by every field. A field can gate more than one feature
+// (e.g. the global engine is needed by cloud, playtime and KV).
+enum Feature : uint32_t {
+    kCloud    = 1u << 0,
+    kManifest = 1u << 1,
+    kPlaytime = 1u << 2,
+    kKv       = 1u << 3,
+};
+
+inline bool HasFeature(uint32_t mask, Feature feature) {
+    return (mask & static_cast<uint32_t>(feature)) != 0;
+}
+
+struct Subsystems {
+    bool cloud = false;
+    bool manifest = false;
+    bool playtime = false;
+    bool kv = false;
+
+    bool All() const { return cloud && manifest && playtime && kv; }
+    bool None() const { return !cloud && !manifest && !playtime && !kv; }
+};
+
 struct FieldResult {
     std::string name;
     bool ok = false;
+    uint32_t subsystems = 0;
     bool critical = false;
     std::string kind;
     std::string detail;
@@ -38,7 +62,10 @@ struct Report {
     uint64_t steamVersion = 0;
     std::string sha256;
     std::string tool;
+    std::string dllVersion;
     Status status = Status::Audit;
+    bool allowlisted = false;
+    Subsystems subsystems;
     std::vector<FieldResult> fields;
     std::vector<std::string> reasons;
     bool liveOk = false;
@@ -62,9 +89,21 @@ bool ProbeMessageLayout(const ScResolver::ResolvedAddrs& resolved,
 // Pure read-only scan; safe on a DONT_RESOLVE_DLL_REFERENCES mapping.
 uint32_t ScanAccountIdOffset(uintptr_t imageBase, size_t imageSize);
 
+// True when sha256 is one of the builds shipped/validated with this DLL. This
+// only matters when the feed is absent and strict=true: it lets a fresh
+// install work offline without weakening the unknown-build rule.
+bool IsAllowlisted(const std::string& sha256);
+
 // Merge a local report with the feed. strict=true means an absent feed keeps
-// the session in audit; strict=false allows a locally full build to run.
-Status Decide(const Report& local, bool feedPresent, Status feedStatus, bool strict);
+// the session in audit unless the build hash is in the compiled allowlist.
+// strict=false preserves the old behaviour for local-only setups.
+Status Decide(const Report& local, bool feedPresent, Status feedStatus,
+              bool strict, bool allowlisted = false);
+
+// Per-feature decision. A cloud failure disables everything; a manifest,
+// playtime or KV failure disables only that feature.
+Subsystems DecideSubsystems(const Report& local, bool feedPresent,
+                            Status feedStatus, bool strict, bool allowlisted);
 
 const char* StatusName(Status status);
 Status ParseStatus(const std::string& text);

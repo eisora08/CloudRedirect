@@ -59,16 +59,34 @@ Json::Value BoolValue(bool value) {
     return v;
 }
 
-void AddField(Report& r, const char* name, bool ok, bool critical,
+void AddField(Report& r, const char* name, bool ok, uint32_t subsystems,
               const char* kind, const std::string& detail = {}) {
     FieldResult f;
     f.name = name;
     f.ok = ok;
-    f.critical = critical;
+    f.subsystems = subsystems;
+    f.critical = subsystems != 0;
     f.kind = kind;
     f.detail = detail;
     r.fields.push_back(std::move(f));
-    if (critical && !ok) r.reasons.push_back(name);
+    if (f.critical && !ok) r.reasons.push_back(name);
+}
+
+bool OffsetOk(uint32_t offset) {
+    return offset != 0 && offset < 0x20000;
+}
+
+void ComputeSubsystems(Report& report) {
+    Subsystems s{true, true, true, true};
+    for (const FieldResult& f : report.fields) {
+        if (f.ok) continue;
+        if (HasFeature(f.subsystems, kCloud)) s.cloud = false;
+        if (HasFeature(f.subsystems, kManifest)) s.manifest = false;
+        if (HasFeature(f.subsystems, kPlaytime)) s.playtime = false;
+        if (HasFeature(f.subsystems, kKv)) s.kv = false;
+    }
+    report.subsystems = s;
+    report.status = s.cloud ? Status::Full : Status::Audit;
 }
 
 } // namespace
@@ -185,76 +203,140 @@ Report BuildStatic(uintptr_t imageBase, size_t imageSize,
     report.liveDetail = "static report only";
 
     const bool imageOk = imageBase != 0 && imageSize != 0;
-    AddField(report, "image", imageOk, true, "pe");
+    AddField(report, "image", imageOk,
+             kCloud | kManifest | kPlaytime | kKv, "pe");
 
-    AddField(report, "ccmInterfaceVtable", InRdata(r.ccmInterfaceVtable), true, "vtable");
-    AddField(report, "serviceTransportVtable", InRdata(r.serviceTransportVtable), true, "vtable");
-    AddField(report, "globalEngine", InData(r.globalEngine), true, "global");
+    AddField(report, "ccmInterfaceVtable", InRdata(r.ccmInterfaceVtable),
+             kCloud, "vtable");
+    AddField(report, "serviceTransportVtable", InRdata(r.serviceTransportVtable),
+             kCloud, "vtable");
+    AddField(report, "globalEngine", InData(r.globalEngine),
+             kCloud | kPlaytime | kKv, "global");
 
-    AddField(report, "parseFromArray", InText(r.parseFromArray), true, "func");
-    AddField(report, "serializeToArray", InText(r.serializeToArray), true, "func");
-    AddField(report, "wrapPacket", InText(r.wrapPacket), true, "func");
-    AddField(report, "bRouteMsgToJob", InText(r.bRouteMsgToJob), true, "func");
-    AddField(report, "releaseWrapped", InText(r.releaseWrapped), true, "func");
-    AddField(report, "refCountHelper", InText(r.refCountHelper), true, "func");
-    AddField(report, "findJob", InText(r.findJob), true, "func");
+    AddField(report, "parseFromArray", InText(r.parseFromArray),
+             kCloud | kPlaytime, "func");
+    AddField(report, "serializeToArray", InText(r.serializeToArray),
+             kCloud | kPlaytime, "func");
+    AddField(report, "wrapPacket", InText(r.wrapPacket), kCloud, "func");
+    AddField(report, "bRouteMsgToJob", InText(r.bRouteMsgToJob), kCloud, "func");
+    AddField(report, "releaseWrapped", InText(r.releaseWrapped), kCloud, "func");
+    AddField(report, "refCountHelper", InText(r.refCountHelper), kCloud, "func");
+    AddField(report, "findJob", InText(r.findJob), kCloud, "func");
 
-    const bool offsetsOk =
-        r.engineOffGlobalHandle != 0 && r.engineOffGlobalHandle < 0x20000 &&
-        r.engineOffUserMap != 0 && r.engineOffUserMap < 0x20000 &&
-        r.engineOffAppInfoCache != 0 && r.engineOffAppInfoCache < 0x20000;
-    AddField(report, "engineOffsets", offsetsOk, true, "offset");
+    const bool engineOffsetsOk = OffsetOk(r.engineOffGlobalHandle) &&
+                                 OffsetOk(r.engineOffUserMap);
+    AddField(report, "engineOffsets", engineOffsetsOk,
+             kCloud | kPlaytime, "offset");
+
+    // These three feed the legacy Approach-D response injection only. If the
+    // resolver can't prove them, that path stays disabled; cloud saves,
+    // manifest pinning, playtime and KV must still work.
+    AddField(report, "engineOffJobMgr", OffsetOk(r.engineOffJobMgr),
+             0, "optional-offset");
+    AddField(report, "ccmOffConnContext", OffsetOk(r.ccmOffConnContext),
+             0, "optional-offset");
+    AddField(report, "userOffCcmInterface", OffsetOk(r.userOffCcmInterface),
+             0, "optional-offset");
 
     const bool accountOk = accountIdResolved && accountIdOffset >= 256 &&
                            accountIdOffset <= 4096;
-    AddField(report, "accountIdOffset", accountOk, true, "offset",
-             accountOk ? std::to_string(accountIdOffset) : "unresolved (no 570 fallback)");
+    AddField(report, "accountIdOffset", accountOk,
+             kCloud | kPlaytime | kKv, "offset",
+             accountOk ? std::to_string(accountIdOffset)
+                       : "unresolved (no 570 fallback)");
 
     const bool layoutOk = (layout.header == 0x28 || layout.header == 0x30) &&
-                          layout.body == layout.header + sizeof(void*);
-    AddField(report, "messageLayout", layoutOk, true, "offset",
+                          layout.body == layout.header + sizeof(void*) &&
+                          layout.emsg != 0 && layout.hdr == layout.header;
+    AddField(report, "messageLayout", layoutOk,
+             kCloud | kPlaytime, "offset",
              layoutOk ? "header/body verified" : "unresolved");
 
-    // Optional subsystems: a failure disables the feature, not cloud saves.
-    AddField(report, "buildDepotDependency", InText(r.buildDepotDependency), false, "func");
-    AddField(report, "bAsyncSend", InText(r.bAsyncSend), false, "func");
-    AddField(report, "pbMsgCtor", InText(r.pbMsgCtor), false, "func");
-    AddField(report, "pbMsgFinalize", InText(r.pbMsgFinalize), false, "func");
-    AddField(report, "pbMsgCleanup", InText(r.pbMsgCleanup), false, "func");
-    AddField(report, "getAppInfo", InText(r.getAppInfo), false, "func");
-    AddField(report, "getSection", InText(r.getSection), false, "func");
-    AddField(report, "readConfigU64", InText(r.readConfigU64), false, "func");
-    AddField(report, "kvFindKey", InText(r.kvFindKey), false, "func");
-    AddField(report, "kvGetUint64", InText(r.kvGetUint64), false, "func");
-    AddField(report, "kvGetInt", InText(r.kvGetInt), false, "func");
-    AddField(report, "kvSetUint64", InText(r.kvSetUint64), false, "func");
-    AddField(report, "kvSetInt", InText(r.kvSetInt), false, "func");
-    AddField(report, "kvSetString", InText(r.kvSetString), false, "func");
-    AddField(report, "jobCurGlobal", InData(r.jobCurGlobal), false, "global");
-    AddField(report, "refCountGlobal", InData(r.refCountGlobal), false, "global");
-    AddField(report, "getUserStatsDesc", InImage(r.getUserStatsDesc), false, "descriptor");
-    AddField(report, "getUserStatsVtable", InRdata(r.getUserStatsVtable), false, "vtable");
-    AddField(report, "respDescriptor", InImage(r.respDescriptor), false, "descriptor");
-    AddField(report, "respWrapperVtable", InRdata(r.respWrapperVtable), false, "vtable");
-    AddField(report, "regKeySyncTime", InImage(r.regKeySyncTime), false, "global");
+    AddField(report, "buildDepotDependency", InText(r.buildDepotDependency),
+             kManifest, "func");
 
-    AddField(report, "engineOffJobMgr", true, false, "hardcoded",
-             "validated on first use");
-    AddField(report, "ccmOffConnContext", true, false, "hardcoded",
-             "validated on first use");
-    AddField(report, "userOffCcmInterface", true, false, "hardcoded",
-             "validated on first use");
+    AddField(report, "bAsyncSend", InText(r.bAsyncSend), kPlaytime, "func");
+    AddField(report, "pbMsgCtor", InText(r.pbMsgCtor), kPlaytime, "func");
+    AddField(report, "pbMsgFinalize", InText(r.pbMsgFinalize), kPlaytime, "func");
+    AddField(report, "pbMsgCleanup", InText(r.pbMsgCleanup), kPlaytime, "func");
+    AddField(report, "getAppMinutesPlayedData",
+             InText(r.getAppMinutesPlayedData), kPlaytime, "func");
+    AddField(report, "flushAppMinutesPlayed",
+             InText(r.flushAppMinutesPlayed), kPlaytime, "func");
+    AddField(report, "setAppLastPlayedTime",
+             InText(r.setAppLastPlayedTime), kPlaytime, "func");
+    AddField(report, "playtimeWriter", InText(r.playtimeWriter), kPlaytime, "func");
+    AddField(report, "yieldIfTimeSlice", InText(r.yieldIfTimeSlice),
+             kPlaytime, "func");
+    AddField(report, "jobCurGlobal", InData(r.jobCurGlobal),
+             kPlaytime, "global");
+    AddField(report, "refCountGlobal", InData(r.refCountGlobal),
+             kPlaytime, "global");
+    AddField(report, "getUserStatsDesc", InImage(r.getUserStatsDesc),
+             kPlaytime, "descriptor");
+    AddField(report, "getUserStatsVtable", InRdata(r.getUserStatsVtable),
+             kPlaytime, "vtable");
+    AddField(report, "respDescriptor", InImage(r.respDescriptor),
+             kPlaytime, "descriptor");
+    AddField(report, "respWrapperVtable", InRdata(r.respWrapperVtable),
+             kPlaytime, "vtable");
+    AddField(report, "regKeySyncTime", InImage(r.regKeySyncTime),
+             kPlaytime, "global");
 
-    report.status = report.reasons.empty() ? Status::Full : Status::Audit;
+    AddField(report, "appInfoCacheOffset", OffsetOk(r.engineOffAppInfoCache),
+             kKv, "offset");
+    AddField(report, "getAppInfo", InText(r.getAppInfo), kKv, "func");
+    AddField(report, "getSection", InText(r.getSection), kKv, "func");
+    AddField(report, "readConfigU64", InText(r.readConfigU64), kKv, "func");
+    AddField(report, "kvFindKey", InText(r.kvFindKey), kKv, "func");
+    AddField(report, "kvGetUint64", InText(r.kvGetUint64), kKv, "func");
+    AddField(report, "kvGetInt", InText(r.kvGetInt), kKv, "func");
+    AddField(report, "kvSetUint64", InText(r.kvSetUint64), kKv, "func");
+    AddField(report, "kvSetInt", InText(r.kvSetInt), kKv, "func");
+    AddField(report, "kvSetString", InText(r.kvSetString), kKv, "func");
+
+    ComputeSubsystems(report);
     return report;
 }
 
-Status Decide(const Report& local, bool feedPresent, Status feedStatus, bool strict) {
+bool IsAllowlisted(const std::string& sha256) {
+    if (sha256.empty()) return false;
+    // Builds validated against this DLL. Keep this list append-only; the feed
+    // can validate newer builds without a DLL rebuild. The current stable hash
+    // is included so a fresh install works offline before the first feed fetch.
+    static const char* const kValidated[] = {
+        // 2026-10-22: stable builds validated with this report schema.
+        "e9045710ec7ee47d7b7488d1c5dda2d933dec7e251e965967a5c48f4df68eb4e",
+        "253e0a11a4415b38c78a42f7bdd6ecc426455f06c1ba6453a48090df3142dbbc",
+    };
+    for (const char* hash : kValidated) {
+        if (sha256 == hash) return true;
+    }
+    return false;
+}
+
+Status Decide(const Report& local, bool feedPresent, Status feedStatus,
+              bool strict, bool allowlisted) {
     if (local.status != Status::Full) return Status::Audit;
-    if (!feedPresent) return strict ? Status::Unverified : Status::Full;
+    if (!feedPresent) {
+        if (!strict) return Status::Full;
+        return allowlisted ? Status::Full : Status::Unverified;
+    }
     if (feedStatus == Status::Blocked) return Status::Blocked;
     if (feedStatus == Status::Full) return Status::Full;
     return Status::Audit;
+}
+
+Subsystems DecideSubsystems(const Report& local, bool feedPresent,
+                            Status feedStatus, bool strict, bool allowlisted) {
+    if (Decide(local, feedPresent, feedStatus, strict, allowlisted) !=
+        Status::Full) {
+        return {};
+    }
+    // A locally full cloud report is the prerequisite for every feature. The
+    // optional features keep their own local verdict.
+    if (!local.subsystems.cloud) return {};
+    return local.subsystems;
 }
 
 const char* StatusName(Status status) {
@@ -278,11 +360,21 @@ std::string ToJson(const Report& report) {
     Json::Value root = Json::Object();
     root.objVal["schema"] = Json::Number(report.schema);
     root.objVal["channel"] = Json::String(report.channel);
+    root.objVal["build_id"] = Json::String(std::to_string(report.steamVersion));
     root.objVal["steam_version"] = Json::Number(static_cast<double>(report.steamVersion));
     root.objVal["steamclient_sha256"] = Json::String(report.sha256);
     root.objVal["tested_at"] = Json::String(NowIso());
     root.objVal["tool"] = Json::String(report.tool);
+    root.objVal["dll_version"] = Json::String(report.dllVersion);
     root.objVal["status"] = Json::String(StatusName(report.status));
+    root.objVal["allowlisted"] = BoolValue(report.allowlisted);
+
+    Json::Value subsystems = Json::Object();
+    subsystems.objVal["cloud"] = BoolValue(report.subsystems.cloud);
+    subsystems.objVal["manifest"] = BoolValue(report.subsystems.manifest);
+    subsystems.objVal["playtime"] = BoolValue(report.subsystems.playtime);
+    subsystems.objVal["kv"] = BoolValue(report.subsystems.kv);
+    root.objVal["subsystems"] = std::move(subsystems);
 
     Json::Value reasons = Json::Array();
     for (const std::string& reason : report.reasons)
@@ -297,6 +389,12 @@ std::string ToJson(const Report& report) {
         field.objVal["critical"] = BoolValue(f.critical);
         if (!f.detail.empty())
             field.objVal["detail"] = Json::String(f.detail);
+        Json::Value fieldSubs = Json::Array();
+        if (HasFeature(f.subsystems, kCloud)) fieldSubs.arrVal.push_back(Json::String("cloud"));
+        if (HasFeature(f.subsystems, kManifest)) fieldSubs.arrVal.push_back(Json::String("manifest"));
+        if (HasFeature(f.subsystems, kPlaytime)) fieldSubs.arrVal.push_back(Json::String("playtime"));
+        if (HasFeature(f.subsystems, kKv)) fieldSubs.arrVal.push_back(Json::String("kv"));
+        field.objVal["subsystems"] = std::move(fieldSubs);
         fields.objVal[f.name] = std::move(field);
     }
     root.objVal["fields"] = std::move(fields);

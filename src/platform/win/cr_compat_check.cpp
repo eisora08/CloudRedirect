@@ -151,6 +151,7 @@ int wmain(int argc, wchar_t** argv) {
     report.channel = channel;
     report.steamVersion = steamVersion;
     report.sha256 = sha256;
+    report.allowlisted = Compat::IsAllowlisted(sha256);
 
     const std::string json = Compat::ToJson(report);
     std::printf("%s\n", json.c_str());
