@@ -7,9 +7,11 @@
 #include "s3_provider.h"
 #include "r2_provider.h"
 #include "cloud_metadata_paths.h"
+#include "gc_grace.h"
 #include "cloud_staging.h"
 #include "file_util.h"
 #include "legacy_metadata_cleanup.h"
+#include "trash_util.h"
 #include "log.h"
 #include "common.h"
 #include "json.h"
@@ -22,6 +24,7 @@
 #include <list>
 #include <algorithm>
 #include <limits>
+#include <unordered_map>
 #include <unordered_set>
 #ifdef _WIN32
 #include <Windows.h>
@@ -228,6 +231,11 @@ void NotifyAuthFailure(const std::string& providerName) {
 
 // WorkItem/EnqueueWork/queue infra moved to cloud_work_queue.h/.cpp.
 static std::string LocalStoragePath(uint32_t accountId, uint32_t appId);
+
+static std::string LocalTrashRoot() {
+    if (g_localRoot.empty()) return {};
+    return TrashUtil::WithSep(g_localRoot + "trash");
+}
 
 static std::string CreateLocalConflictCopy(uint32_t accountId, uint32_t appId,
                                            const std::string& filename,
@@ -962,8 +970,9 @@ void Init(const std::string& localRoot, std::unique_ptr<ICloudProvider> provider
     LOG("[CloudStorage] Initialized. localRoot=%s provider=%s",
         g_localRoot.c_str(), g_provider ? g_provider->Name() : "none (local-only)");
 
-    // Prune stale conflict copies once per process launch (best-effort).
+    // Prune stale conflict copies and deleted-file trash once per launch.
     PruneStaleConflictCopies(g_localRoot);
+    TrashUtil::Prune(LocalTrashRoot());
 
     // Drop legacy-named Playtime.bin/UserGameStats.bin in the local blob cache
     // whenever the canonical `.cloudredirect\` sibling already exists.
@@ -1620,6 +1629,15 @@ std::vector<uint8_t> RetrieveBlob(uint32_t accountId, uint32_t appId,
 
 bool DeleteBlob(uint32_t accountId, uint32_t appId,
                 const std::string& filename) {
+    // Account-scope is metadata-only (playtime/stats). Never let an unexpected
+    // filename take the immediate cloud-delete path: local trash already keeps
+    // a copy, but the cloud copy would be gone before anyone notices.
+    if (appId == CloudIntercept::kAccountScopeAppId &&
+        !CloudIntercept::IsAccountScopeMetadataFilename(filename)) {
+        LOG("[CloudStorage] DeleteBlob: refusing account-scope non-metadata path "
+            "app=%u file=%s", appId, filename.c_str());
+        return false;
+    }
     if (!DeleteBlobStaged(accountId, appId, filename)) return false;
     if (g_provider) {
         if (appId == CloudIntercept::kAccountScopeAppId) {
@@ -1644,15 +1662,40 @@ bool DeleteBlobStaged(uint32_t accountId, uint32_t appId,
 
     std::string localPath = LocalBlobPath(accountId, appId, filename);
     if (localPath.empty()) return false; // path traversal blocked
+
+    // Move the cached copy to trash before removing it. A mistaken delete then
+    // costs nothing for 30 days instead of losing the only local copy. If the
+    // move fails, keep the cache and fail the delete instead of destroying the
+    // last copy.
+    const std::filesystem::path localFs = FileUtil::Utf8ToPath(localPath);
     std::error_code ec;
-    std::filesystem::remove(FileUtil::Utf8ToPath(localPath), ec);
+    const bool localExists = std::filesystem::exists(localFs, ec);
+    if (ec) {
+        LOG("[CloudStorage] DeleteBlob: cannot stat local cache %s: %s",
+            filename.c_str(), ec.message().c_str());
+        return false;
+    }
+    bool trashed = false;
+    if (localExists) {
+        const std::string rel = std::to_string(accountId) + "/" +
+                                std::to_string(appId) + "/" + filename;
+        trashed = TrashUtil::Move(LocalTrashRoot(), localPath, rel);
+        if (!trashed) {
+            LOG("[CloudStorage] DeleteBlob: refusing to delete %s: could not move "
+                "local cache to trash", filename.c_str());
+            return false;
+        }
+    }
+
+    std::filesystem::remove(localFs, ec);
 
     // Empty-parent cleanup routed through LocalStorage to share the
     // WriteFileNoIncrement mutex (avoids TOCTOU on concurrent writes).
-    std::filesystem::path fileParent = FileUtil::Utf8ToPath(localPath).parent_path();
+    std::filesystem::path fileParent = localFs.parent_path();
     LocalStorage::CleanupEmptyCacheDirs(accountId, appId, {FileUtil::PathToUtf8(fileParent)});
 
-    LOG("[CloudStorage] DeleteBlob: removed local cache: %s", filename.c_str());
+    LOG("[CloudStorage] DeleteBlob: removed local cache: %s%s", filename.c_str(),
+        trashed ? " (kept in trash)" : "");
 
     // CN is incremented once per batch in HandleCompleteBatch, not per file.
 
@@ -2011,6 +2054,45 @@ bool HasLocalBlob(uint32_t accountId, uint32_t appId, const std::string& filenam
 }
 
 
+// Orphaned cloud blobs are not deleted on first sight. A transient listing
+// omission, a failed state fetch or a user deleting the wrong save must not
+// become an irreversible provider-side delete. Each orphan is journaled with
+// the first time GC saw it orphaned, then removed only after a grace period.
+static constexpr uint64_t kOrphanGraceSeconds = 30ULL * 24 * 60 * 60;
+
+static std::string OrphanGracePath() {
+    return g_localRoot + "gc_pending.tsv";
+}
+
+static std::unordered_map<std::string, uint64_t> LoadOrphanGrace() {
+    std::unordered_map<std::string, uint64_t> out;
+    std::ifstream f(FileUtil::Utf8ToPath(OrphanGracePath()));
+    if (!f) return out;
+    std::string line;
+    while (std::getline(f, line)) {
+        const size_t tab = line.find('\t');
+        if (tab == std::string::npos || tab == 0) continue;
+        try {
+            out[line.substr(0, tab)] = std::stoull(line.substr(tab + 1));
+        } catch (...) {
+            // Ignore a damaged journal line; a fresh timestamp is safer than
+            // treating the blob as old enough to delete.
+        }
+    }
+    return out;
+}
+
+static void SaveOrphanGrace(const std::unordered_map<std::string, uint64_t>& pending) {
+    std::string text;
+    for (const auto& [path, seen] : pending) {
+        text += path;
+        text += '\t';
+        text += std::to_string(seen);
+        text += '\n';
+    }
+    FileUtil::AtomicWriteText(OrphanGracePath(), text);
+}
+
 // GC: delete unreferenced blobs. Keeps manifest-referenced canonical and
 // legacy-SHA blobs; deletes everything else. Requires complete listing.
 // Returns count deleted, or -1 on error.
@@ -2189,19 +2271,28 @@ int GarbageCollectBlobs(uint32_t accountId, uint32_t appId) {
         return promoted;
     }
 
-    LOG("[GC] app=%u: found %zu orphaned blobs out of %zu total, deleting...",
+    LOG("[GC] app=%u: found %zu orphaned blobs out of %zu total",
         appId, orphans.size(), remoteBlobs.size());
 
+    // Debounce: journal first sight and only delete after the grace period.
+    const uint64_t now = static_cast<uint64_t>(std::time(nullptr));
+    GcGrace::Plan plan = GcGrace::PlanDeletes(
+        orphans, LoadOrphanGrace(), now, kOrphanGraceSeconds);
+
     int deleted = 0;
-    for (const auto& path : orphans) {
+    for (const auto& path : plan.toDelete) {
         if (g_provider->Remove(path)) {
+            plan.pending.erase(path);
             ++deleted;
         } else {
             LOG("[GC] app=%u: failed to delete blob %s", appId, path.c_str());
         }
     }
+    SaveOrphanGrace(plan.pending);
 
-    LOG("[GC] app=%u: deleted %d/%zu orphaned blobs", appId, deleted, orphans.size());
+    LOG("[GC] app=%u: deleted %d, deferred %d/%zu orphaned blobs (grace %llu days)",
+        appId, deleted, plan.deferred, orphans.size(),
+        (unsigned long long)(kOrphanGraceSeconds / (24 * 60 * 60)));
     InvalidateBlobIndex(accountId, appId);
     InvalidateBlobListingCache(accountId, appId);
     return deleted + promoted;

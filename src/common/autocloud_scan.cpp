@@ -2,6 +2,7 @@
 #include "autocloud_util.h"
 #include "file_util.h"
 #include "log.h"
+#include "sha1_util.h"
 #include "steam_root_ids.h"
 #include "vdf.h"
 #ifdef _WIN32
@@ -581,27 +582,13 @@ static std::vector<AutoCloudRuleNative> LoadAutoCloudRules(const std::string& st
 
 // SHA1 for files
 
-// Read a whole file and SHA1 it in one pass, returning the bytes in outBytes so
-// the caller can reuse them without a second read. Returns empty on error.
+// Hash a file incrementally. outBytes is kept for the test-only API but is no
+// longer populated: reading a multi-GB save into RAM just to hash it defeats
+// the point of streaming. Empty hash signals an error.
 static std::vector<uint8_t> ReadAndHashFile(const std::string& path,
                                             std::vector<uint8_t>& outBytes) {
     outBytes.clear();
-    std::ifstream f(FileUtil::Utf8ToPath(path), std::ios::binary);
-    if (!f) return {};
-
-    f.seekg(0, std::ios::end);
-    auto size = f.tellg();
-    if (size < 0) {
-        return {};
-    }
-    f.seekg(0);
-    std::vector<uint8_t> buf(static_cast<size_t>(size));
-    if (!buf.empty() && !f.read(reinterpret_cast<char*>(buf.data()), size)) {
-        return {};  // Empty vector signals error
-    }
-    auto sha = FileUtil::SHA1(buf.data(), buf.size());
-    outBytes = std::move(buf);
-    return sha;
+    return Sha1Util::File(path);
 }
 
 } // anonymous namespace

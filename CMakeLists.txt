@@ -241,6 +241,24 @@ else()
 endif()
 add_test(NAME pending_ops_journal_tests COMMAND pending_ops_journal_tests)
 
+# Local delete trash: move, retention prune, and traversal rejection.
+add_executable(trash_util_tests tests-fork/trash_util_tests.cpp)
+target_include_directories(trash_util_tests PRIVATE src/common)
+target_compile_definitions(trash_util_tests PRIVATE
+    CR_RELEASE_VERSION="${CR_RELEASE_VERSION}")
+if(WIN32)
+    target_include_directories(trash_util_tests PRIVATE src/platform/win)
+    target_sources(trash_util_tests PRIVATE
+        src/platform/win/log.cpp
+        src/platform/win/platform_win.cpp)
+else()
+    target_include_directories(trash_util_tests PRIVATE src/platform/linux)
+    target_sources(trash_util_tests PRIVATE
+        src/platform/linux/log.cpp
+        src/platform/linux/platform_linux.cpp)
+endif()
+add_test(NAME trash_util_tests COMMAND trash_util_tests)
+
 # ── Fork tests (tests-fork/) ────────────────────────────────────────────
 add_executable(steam_message_layout_tests tests-fork/steam_message_layout_tests.cpp)
 target_include_directories(steam_message_layout_tests PRIVATE src/platform/win)

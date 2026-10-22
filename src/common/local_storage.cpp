@@ -4,6 +4,7 @@
 #include "cloud_metadata_paths.h"
 #include "file_util.h"
 #include "log.h"
+#include "sha1_util.h"
 #include "steam_root_ids.h"
 
 using CloudIntercept::kCNFilename;
@@ -943,23 +944,9 @@ std::vector<uint8_t> SHA1(const uint8_t* data, size_t len) {
     return hash;
 }
 
-// Streaming SHA1 (UTF-8 path).
+// Streaming SHA1 (UTF-8 path). Never allocates the whole file.
 static std::vector<uint8_t> SHA1File(const std::string& path) {
-    std::ifstream f(FileUtil::Utf8ToPath(path), std::ios::binary);
-    if (!f) return {};
-
-    f.seekg(0, std::ios::end);
-    auto size = f.tellg();
-    if (size < 0) return {};
-    if (size == 0) { static const uint8_t empty = 0; return SHA1(&empty, 0); }
-    f.seekg(0);
-    std::vector<uint8_t> buf((size_t)size);
-    if (!f.read(reinterpret_cast<char*>(buf.data()), (size_t)size)) {
-        auto actual = f.gcount();
-        if (actual == 0) return {};
-        buf.resize(static_cast<size_t>(actual));
-    }
-    return SHA1(buf.data(), buf.size());
+    return Sha1Util::File(path);
 }
 
 std::vector<FileEntry> GetFileList(uint32_t accountId, uint32_t appId) {

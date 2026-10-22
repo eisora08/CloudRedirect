@@ -1,10 +1,15 @@
 // Exercise the full rule round trip: appinfo -> CR's local resolution -> KV
 // injection -> Steam's root overrides. No game files or Steam process needed.
 #include "autocloud_injection.h"
+#include "cloud_metadata_paths.h"
 #include "forensic_util.h"
+#include "gc_grace.h"
 #include "heal_overlay_util.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <unordered_map>
@@ -339,7 +344,8 @@ static void ForensicVerdicts() {
         local.mtime = 500;
         CHECK(ClassifyServeVerdict(local, shaB, 1000) == ServeVerdict::CloudNewer);
     }
-    // No sha computed (over cap): timestamps only.
+    // No sha computed (budget/read error): timestamps only. A local file within
+    // the clock-skew window is treated as newer to avoid silently overwriting it.
     {
         LocalFileInfo local;
         local.exists = true;
@@ -347,8 +353,20 @@ static void ForensicVerdicts() {
         CHECK(ClassifyServeVerdict(local, shaA, 1000) == ServeVerdict::LocalNewer);
         local.mtime = 500;
         CHECK(ClassifyServeVerdict(local, shaA, 1000) == ServeVerdict::ShaSkipped);
+        local.mtime = 900;  // 100s behind served, inside 300s skew
+        CHECK(ClassifyServeVerdict(local, shaA, 1000) == ServeVerdict::LocalNewer);
         local.mtime = 0;
         CHECK(ClassifyServeVerdict(local, shaA, 1000) == ServeVerdict::ShaSkipped);
+    }
+    // Content differs and local is only slightly behind: still protect local.
+    {
+        LocalFileInfo local;
+        local.exists = true;
+        local.sha = shaA;
+        local.mtime = 900;
+        CHECK(ClassifyServeVerdict(local, shaB, 1000) == ServeVerdict::LocalNewer);
+        local.mtime = 600;  // outside skew -> normal cloud download
+        CHECK(ClassifyServeVerdict(local, shaB, 1000) == ServeVerdict::CloudNewer);
     }
     // Hex encoding is full-width (40 chars for a real SHA-1).
     CHECK(ForensicUtil::ShaHex(shaA).size() == 8); // test vector is 4 bytes
@@ -383,19 +401,14 @@ static void BackupBeforeOverwriteDecision() {
     using ForensicUtil::ServeVerdict;
     using ForensicUtil::ShouldBackupBeforeOverwrite;
 
-    constexpr uint64_t kCap = ForensicUtil::kMaxShaFileBytes;
-    // LOCAL-NEWER with a local file under the cap: snapshot to .bak first.
-    CHECK(ShouldBackupBeforeOverwrite(ServeVerdict::LocalNewer, true, 1024, kCap));
-    // Exactly at the cap still backs up.
-    CHECK(ShouldBackupBeforeOverwrite(ServeVerdict::LocalNewer, true, kCap, kCap));
-    // Over the cap: skip (logged as "skipping backup (local size > cap)").
-    CHECK(!ShouldBackupBeforeOverwrite(ServeVerdict::LocalNewer, true, kCap + 1, kCap));
+    // LOCAL-NEWER with a local file: snapshot to .bak first, regardless of size.
+    CHECK(ShouldBackupBeforeOverwrite(ServeVerdict::LocalNewer, true));
     // No local file: nothing to snapshot.
-    CHECK(!ShouldBackupBeforeOverwrite(ServeVerdict::LocalNewer, false, 1024, kCap));
+    CHECK(!ShouldBackupBeforeOverwrite(ServeVerdict::LocalNewer, false));
     // Other verdicts never back up.
-    CHECK(!ShouldBackupBeforeOverwrite(ServeVerdict::CloudNewer, true, 1024, kCap));
-    CHECK(!ShouldBackupBeforeOverwrite(ServeVerdict::Match, true, 1024, kCap));
-    CHECK(!ShouldBackupBeforeOverwrite(ServeVerdict::LocalMissing, false, 1024, kCap));
+    CHECK(!ShouldBackupBeforeOverwrite(ServeVerdict::CloudNewer, true));
+    CHECK(!ShouldBackupBeforeOverwrite(ServeVerdict::Match, true));
+    CHECK(!ShouldBackupBeforeOverwrite(ServeVerdict::LocalMissing, false));
 }
 
 static void HealOverlayLocalOntoCloudTests() {
@@ -460,6 +473,112 @@ static void HealOverlayLocalOntoCloudTests() {
     CHECK(emptyState.files.empty());
 }
 
+static void StreamingSha1() {
+    using Sha1Util::Digest;
+    using Sha1Util::Sha1;
+
+    auto hex = [](const std::vector<uint8_t>& d) {
+        return ForensicUtil::ShaHex(d);
+    };
+    CHECK(hex(Digest("", 0)) == "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+    CHECK(hex(Digest("abc", 3)) == "a9993e364706816aba3e25717850c26c9cd0d89d");
+
+    // Chunked updates must produce the same digest as one-shot input.
+    std::vector<uint8_t> longInput(1000000, 'a');
+    Sha1 chunked;
+    for (size_t off = 0; off < longInput.size(); off += 7777) {
+        const size_t n = std::min<size_t>(7777, longInput.size() - off);
+        chunked.Update(longInput.data() + off, n);
+    }
+    const auto chunkedDigest = chunked.Final();
+    CHECK(hex(std::vector<uint8_t>(chunkedDigest.begin(), chunkedDigest.end())) ==
+          "34aa973cd4c4daa4f61eeb2bdbad27316534016f");
+
+    // File hashing must match in-memory hashing and handle >16 MB.
+    std::error_code ec;
+    auto path = std::filesystem::temp_directory_path(ec) / "cloudredirect_sha1_test.bin";
+    if (!ec) {
+        {
+            std::ofstream f(path, std::ios::binary | std::ios::trunc);
+            std::vector<char> chunk(1u << 20, 'b');
+            for (int i = 0; i < 20; ++i) f.write(chunk.data(), chunk.size());
+        }
+        uint64_t read = 0;
+        bool truncated = false;
+        auto fileDigest = Sha1Util::File(path, UINT64_MAX, &read, &truncated);
+        std::vector<uint8_t> expected(20u << 20, 'b');
+        CHECK(!fileDigest.empty());
+        CHECK(read == expected.size());
+        CHECK(!truncated);
+        CHECK(hex(fileDigest) == hex(Digest(expected.data(), expected.size())));
+
+        // maxBytes equal to the file size is not truncation.
+        uint64_t exactRead = 0;
+        bool exactTruncated = true;
+        auto exactDigest = Sha1Util::File(path, expected.size(), &exactRead,
+                                          &exactTruncated);
+        CHECK(exactRead == expected.size());
+        CHECK(!exactTruncated);
+        CHECK(hex(exactDigest) == hex(fileDigest));
+
+        std::filesystem::remove(path, ec);
+    }
+}
+
+static void GcGraceTests() {
+    using GcGrace::PlanDeletes;
+
+    const std::vector<std::string> orphans = {"a", "b"};
+
+    // First sight: journal both, delete nothing.
+    auto first = PlanDeletes(orphans, {}, 1000, 100);
+    CHECK(first.toDelete.empty());
+    CHECK(first.deferred == 2);
+    CHECK(first.pending.at("a") == 1000);
+    CHECK(first.pending.at("b") == 1000);
+
+    // Still inside the grace window: defer again.
+    auto young = PlanDeletes(orphans, first.pending, 1099, 100);
+    CHECK(young.toDelete.empty());
+    CHECK(young.deferred == 2);
+
+    // Exactly at the boundary: old enough to delete.
+    auto ripe = PlanDeletes(orphans, first.pending, 1100, 100);
+    CHECK(ripe.toDelete.size() == 2);
+    CHECK(ripe.deferred == 0);
+
+    // A path that is no longer orphaned leaves the journal.
+    auto reuploaded = PlanDeletes({"a"}, first.pending, 2000, 100);
+    CHECK(reuploaded.toDelete.size() == 1 && reuploaded.toDelete[0] == "a");
+    CHECK(reuploaded.pending.count("b") == 0);
+
+    // A clock that moved backwards must not age entries into deletion.
+    auto backwards = PlanDeletes(orphans, first.pending, 500, 100);
+    CHECK(backwards.toDelete.empty());
+    CHECK(backwards.deferred == 2);
+}
+
+static void AccountScopeDeleteGuard() {
+    using CloudIntercept::IsAccountScopeMetadataFilename;
+
+    CHECK(IsAccountScopeMetadataFilename("Playtime/123.bin"));
+    CHECK(IsAccountScopeMetadataFilename("Playtime\\123.bin"));
+    CHECK(IsAccountScopeMetadataFilename("UserGameStats/0.bin"));
+    CHECK(IsAccountScopeMetadataFilename("UserGameStats\\987654321.bin"));
+
+    // Only <digits>.bin directly under the two metadata roots is valid.
+    CHECK(!IsAccountScopeMetadataFilename(""));
+    CHECK(!IsAccountScopeMetadataFilename("Playtime/"));
+    CHECK(!IsAccountScopeMetadataFilename("Playtime/abc.bin"));
+    CHECK(!IsAccountScopeMetadataFilename("Playtime/123"));
+    CHECK(!IsAccountScopeMetadataFilename("Playtime/123.txt"));
+    CHECK(!IsAccountScopeMetadataFilename("Playtime//123.bin"));
+    CHECK(!IsAccountScopeMetadataFilename("Playtime/123.bin/extra"));
+    CHECK(!IsAccountScopeMetadataFilename("Playtime/../123.bin"));
+    CHECK(!IsAccountScopeMetadataFilename("Other/123.bin"));
+    CHECK(!IsAccountScopeMetadataFilename("saves/123.bin"));
+}
+
 int main() {
     SummerClover();
     PlainRulesStayUnchanged();
@@ -470,6 +589,9 @@ int main() {
     ForensicVerdicts();
     TsGuardBumpsServedTimestamp();
     BackupBeforeOverwriteDecision();
+    StreamingSha1();
+    GcGraceTests();
+    AccountScopeDeleteGuard();
     HealOverlayLocalOntoCloudTests();
     // Callers without an explicit cloud root retain their existing root.
     auto legacy = Rule("WinSavedGames", "Example");

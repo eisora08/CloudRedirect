@@ -2,6 +2,7 @@
 #include "file_util.h"
 #include "cloud_storage.h"
 #include "log.h"
+#include "trash_util.h"
 #include "miniz.h"
 
 #include <sys/socket.h>
@@ -26,6 +27,15 @@
 #include <unordered_map>
 
 static std::string g_blobRoot;
+// g_blobRoot is <cloud_redirect>/storage/; trash is a sibling.
+static std::string TrashRoot() {
+    std::string root = g_blobRoot;
+    while (!root.empty() && (root.back() == '\\' || root.back() == '/'))
+        root.pop_back();
+    const size_t sep = root.find_last_of("\\/");
+    if (sep != std::string::npos) root = root.substr(0, sep + 1);
+    return root + "trash/";
+}
 static uint32_t g_accountId = 0;
 static uint16_t g_port = 0;
 static int g_listenFd = -1;
@@ -756,7 +766,25 @@ bool DeleteBlob(uint32_t accountId, uint32_t appId, const std::string& filename)
     std::string path = BlobPath(accountId, appId, filename);
     if (!FileUtil::IsPathWithin(g_blobRoot, path)) return false;
     std::error_code ec;
-    return std::filesystem::remove(path, ec);
+    const bool exists = std::filesystem::exists(path, ec);
+    if (ec) {
+        LOG("[HTTP] DeleteBlob: cannot stat %s: %s", filename.c_str(),
+            ec.message().c_str());
+        return false;
+    }
+    bool trashed = false;
+    if (exists) {
+        const std::string rel = std::to_string(accountId) + "/" +
+                                std::to_string(appId) + "/" + filename;
+        trashed = TrashUtil::Move(TrashRoot(), path, rel);
+        if (!trashed) {
+            LOG("[HTTP] DeleteBlob: refusing to delete %s: could not move to trash",
+                filename.c_str());
+            return false;
+        }
+    }
+    const bool removed = std::filesystem::remove(path, ec);
+    return removed || trashed;
 }
 
 } // namespace HttpServer

@@ -12,6 +12,7 @@
 #include "cloud_staging.h"
 #include "app_state.h"
 #include "cloud_storage.h"
+#include "cloud_metadata_paths.h"
 #include "forensic_util.h"
 #include "heal_overlay_util.h"
 #include "coop_yield.h"
@@ -2506,8 +2507,7 @@ RpcResult HandleFileDownload(uint32_t appId, const std::vector<PB::Field>& reqBo
             if (forVerdict == ForensicUtil::ServeVerdict::LocalNewer &&
                 forLocal.exists && !forLocalPath.empty()) {
                 if (ForensicUtil::ShouldBackupBeforeOverwrite(forVerdict,
-                        forLocal.exists, forLocal.size,
-                        ForensicUtil::kMaxShaFileBytes)) {
+                        forLocal.exists)) {
                     std::error_code ec;
                     auto srcPath = FileUtil::Utf8ToPath(forLocalPath);
                     auto bakPath = FileUtil::Utf8ToPath(forLocalPath + ".bak");
@@ -2522,9 +2522,6 @@ RpcResult HandleFileDownload(uint32_t appId, const std::vector<PB::Field>& reqBo
                             appId, cleanName.c_str(), forLocalPath.c_str(),
                             (unsigned long long)forLocal.size);
                     }
-                } else {
-                    LOG("[NS-BAK] app=%u file=%s: skipping backup (local size %llu > cap)",
-                        appId, cleanName.c_str(), (unsigned long long)forLocal.size);
                 }
             }
         }
@@ -2568,6 +2565,13 @@ RpcResult HandleDeleteFile(uint32_t appId, const std::vector<PB::Field>& reqBody
 
     if (IsReservedBlobFilename(cleanName)) {
         LOG("[NS] DeleteFile app=%u ignored for reserved /blobs/ name %s", appId, cleanName.c_str());
+        return PB::Writer();
+    }
+
+    if (appId == CloudIntercept::kAccountScopeAppId &&
+        !CloudIntercept::IsAccountScopeMetadataFilename(cleanName)) {
+        LOG("[NS] DeleteFile app=%u REJECTED: non-metadata account-scope path %s",
+            appId, cleanName.c_str());
         return PB::Writer();
     }
 

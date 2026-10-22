@@ -48,6 +48,28 @@ inline std::string AccountStatsFilename(uint32_t appId) {
     return "UserGameStats/" + std::to_string(appId) + ".bin";
 }
 
+// True only for the filename-addressed blobs that legitimately live under the
+// synthetic account-scope appId (0). Anything else in that namespace is a bug
+// or a malformed request and must not be allowed to take the immediate cloud
+// delete path.
+inline bool IsAccountScopeMetadataFilename(std::string_view name) {
+    auto matches = [&](std::string_view root) {
+        if (name.size() <= root.size() + 4) return false;
+        if (name.substr(0, root.size()) != root) return false;
+        const char sep = name[root.size()];
+        if (sep != '/' && sep != '\\') return false;
+        std::string_view tail = name.substr(root.size() + 1);
+        if (tail.size() < 5) return false;
+        if (tail.substr(tail.size() - 4) != ".bin") return false;
+        tail.remove_suffix(4);
+        for (char c : tail) {
+            if (c < '0' || c > '9') return false;
+        }
+        return true;
+    };
+    return matches("Playtime") || matches("UserGameStats");
+}
+
 // True if filename is internal metadata.
 inline bool IsInternalMetadataFile(std::string_view cleanName) {
     return cleanName == kPlaytimeMetadataPath ||

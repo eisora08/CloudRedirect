@@ -13,13 +13,17 @@
 
 #include "autocloud_util.h"
 #include "file_util.h"
+#include "sha1_util.h"
 
 namespace ForensicUtil {
 
-// Hash only local files up to this size; larger files compare size/mtime only.
-static constexpr uintmax_t kMaxShaFileBytes = 16ULL * 1024 * 1024;
-// Total hashing budget per changelist call (bounds BMainLoop stall).
+// Total hashing budget per changelist call (bounds BMainLoop stall). Files are
+// hashed incrementally, so this is a time bound, not a memory bound.
 static constexpr uint64_t kShaBudgetBytes = 64ULL * 1024 * 1024;
+// Local and provider clocks can differ by a few minutes. Differences inside
+// this window are treated as ambiguous and resolved in favour of the local
+// file (back it up / keep it) instead of silently overwriting it.
+static constexpr uint64_t kTimestampSkewSeconds = 300;
 
 struct ForensicRule {
     std::string token;        // %WinAppDataLocalLow%
@@ -34,7 +38,7 @@ struct LocalFileInfo {
     uint64_t size = 0;
     uint64_t mtime = 0;            // unix seconds, 0 when unknown
     std::vector<uint8_t> sha;      // empty when skipped/unavailable
-    bool shaSkipped = false;       // over cap, budget, or read error
+    bool shaSkipped = false;       // over budget or read error
 };
 
 enum class ServeVerdict {
@@ -58,20 +62,30 @@ inline const char* ServeVerdictName(ServeVerdict v) {
     return "unknown";
 }
 
+// True when the local file is not older than the served timestamp by more than
+// the clock-skew tolerance. Within the window we cannot prove the cloud copy is
+// newer, so the caller must protect the local file.
+inline bool LocalNotOlderThanSkew(uint64_t localMtime, uint64_t servedTs) {
+    if (localMtime == 0 || servedTs == 0) return false;
+    if (localMtime >= servedTs) return true;
+    return servedTs - localMtime <= kTimestampSkewSeconds;
+}
+
 inline ServeVerdict ClassifyServeVerdict(const LocalFileInfo& local,
                                          const std::vector<uint8_t>& servedSha,
                                          uint64_t servedTs) {
     if (!local.exists) return ServeVerdict::LocalMissing;
     if (servedSha.empty()) return ServeVerdict::NoServedSha;
     if (local.sha.empty()) {
-        // No local sha: fall back to timestamps. Local mtime past the served
-        // timestamp is the dangerous direction even without content proof.
-        if (local.mtime != 0 && servedTs != 0 && local.mtime > servedTs)
+        // No local sha: fall back to timestamps. A local mtime at or near the
+        // served timestamp is the dangerous direction even without content
+        // proof (the old code only caught local > served exactly).
+        if (LocalNotOlderThanSkew(local.mtime, servedTs))
             return ServeVerdict::LocalNewer;
         return ServeVerdict::ShaSkipped;
     }
     if (local.sha == servedSha) return ServeVerdict::Match;
-    if (local.mtime != 0 && servedTs != 0 && local.mtime > servedTs)
+    if (LocalNotOlderThanSkew(local.mtime, servedTs))
         return ServeVerdict::LocalNewer;
     return ServeVerdict::CloudNewer;
 }
@@ -93,14 +107,11 @@ inline uint64_t TsGuardBumpServedTs(bool responseIsDelta, ServeVerdict verdict,
 // [NS-BAK] LOCAL-NEWER on a download: Steam is about to overwrite a newer
 // local save with an older cloud blob. Snapshot the local file to <file>.bak
 // first so the progress is never unrecoverable. (*.bak doesn't match the
-// game's save patterns, so the backup is never re-uploaded.) True when a
-// backup must be written; false when skipped (other verdict, no local file,
-// or local size over the backup cap).
-inline bool ShouldBackupBeforeOverwrite(ServeVerdict verdict, bool localExists,
-                                        uint64_t localSize,
-                                        uint64_t maxBackupBytes) {
-    return verdict == ServeVerdict::LocalNewer && localExists &&
-           localSize <= maxBackupBytes;
+// game's save patterns, so the backup is never re-uploaded.) There is no size
+// cap: copy_file streams the bytes and a large save is exactly the case where
+// losing the local copy is worst.
+inline bool ShouldBackupBeforeOverwrite(ServeVerdict verdict, bool localExists) {
+    return verdict == ServeVerdict::LocalNewer && localExists;
 }
 
 // Lowercase hex of the full SHA-1 (40 chars); empty input -> empty string.
@@ -183,22 +194,22 @@ inline LocalFileInfo InspectLocalFile(const std::string& utf8Path,
     if (!ec) out.size = sz;
     auto ft = std::filesystem::last_write_time(path, ec);
     if (!ec) out.mtime = AutoCloudUtil::FileTimeToUnixSeconds(ft);
-    if (out.size == 0 || out.size > kMaxShaFileBytes || out.size > shaBudget) {
+    if (out.size == 0 || out.size > shaBudget) {
         out.shaSkipped = true;
         return out;
     }
-    std::ifstream f(path, std::ios::binary);
-    if (!f) {
+
+    // Hash incrementally: a large save must never be loaded into RAM just to
+    // decide whether Steam is about to overwrite it.
+    uint64_t bytesRead = 0;
+    bool truncated = false;
+    out.sha = Sha1Util::File(utf8Path, out.size, &bytesRead, &truncated);
+    if (out.sha.empty() || truncated || bytesRead != out.size) {
+        out.sha.clear();
         out.shaSkipped = true;
         return out;
     }
-    std::vector<uint8_t> buf((size_t)out.size);
-    if (!f.read(reinterpret_cast<char*>(buf.data()), (std::streamsize)out.size)) {
-        out.shaSkipped = true;
-        return out;
-    }
-    out.sha = FileUtil::SHA1(buf.data(), buf.size());
-    shaBudget -= out.size;
+    shaBudget -= bytesRead;
     return out;
 }
 
