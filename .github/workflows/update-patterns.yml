@@ -52,11 +52,11 @@ jobs:
       - name: Build cr_compat_check
         run: cmake --build build --config Release --target cr_compat_check
 
-      # The runner images ship no Steam at all, so this step installs it
-      # (silent, to C:\Steam) when missing, then launches steam.exe -silent:
-      # that single headless path both bootstraps a fresh install and updates
-      # a stale one. Bounded waits; failure to obtain steamclient64.dll at all
-      # fails the run (a pattern workflow with nothing to scan is broken).
+      # GitHub-hosted Windows runners do NOT ship Steam and the SteamSetup
+      # bootstrapper does not complete silently in this sandbox, so this
+      # step only LOCATES an existing Steam install (none on the hosted
+      # image) and gracefully skips when absent. Pattern generation for new
+      # builds happens on the maintainer's PC via scripts/CompatAhora.bat.
       - name: Ensure runner Steam client (install/update, best effort)
         id: ensure
         shell: pwsh
@@ -70,35 +70,12 @@ jobs:
           $steamDir = $candidates | Where-Object { Test-Path "$_\steamclient64.dll" } | Select-Object -First 1
 
           if (-not $steamDir) {
-            Write-Host "::notice::Steam not on this runner image; installing silently (best effort)"
-            $setup = Join-Path $env:RUNNER_TEMP "SteamSetup.exe"
-            try {
-              Invoke-WebRequest -Uri "https://cdn.akamai.steamstatic.com/client/installer/SteamSetup.exe" -OutFile $setup -UseBasicParsing
-              Write-Host "Downloaded SteamSetup.exe ($((Get-Item $setup).Length) bytes)"
-              # NSIS: /S = silent, /D= must come last and must NOT be quoted
-              # -> the target path may not contain spaces, hence C:\Steam.
-              $proc = Start-Process -FilePath $setup -ArgumentList '/S', '/D=C:\Steam' -PassThru -WindowStyle Hidden
-              $proc.WaitForExit(300000)
-              Write-Host "SteamSetup exited with code $($proc.ExitCode)"
-              Start-Sleep -Seconds 10
-              if (-not (Test-Path 'C:\Steam\steam.exe')) {
-                $found = Get-ChildItem -Path 'C:\' -Filter 'steam.exe' -Recurse -ErrorAction SilentlyContinue -Depth 4 | Select-Object -First 1
-                if ($found) {
-                  $steamDir = $found.DirectoryName
-                  Write-Host "Steam found at $steamDir (installer ignored /D=)"
-                }
-              }
-            } catch {
-              Write-Host "::warning::SteamSetup failed: $_"
-            }
-            # Some builds ignore /D=; take whichever install now exists.
-            $steamDir = $candidates | Where-Object { Test-Path "$_\steam.exe" } | Select-Object -First 1
-          }
-
-          if (-not $steamDir) {
-            # SteamSetup did not land an install (sandbox/NSIS quirk); fall
-            # back gracefully instead of failing the whole run.
-            Write-Host "::warning::Steam could not be installed on this runner; skipping this run"
+            # GitHub-hosted Windows runners do NOT ship Steam and the
+            # SteamSetup bootstrapper does not complete silently in this
+            # sandbox, so CI cannot obtain a current steamclient64.dll on
+            # its own. Pattern generation happens on the maintainer's PC via
+            # scripts/CompatAhora.bat; this workflow gracefully skips.
+            Write-Host "::notice::Steam not present on this runner image; skipping this run"
             echo "present=false" >> $env:GITHUB_OUTPUT
             exit 0
           }
