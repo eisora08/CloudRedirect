@@ -18,6 +18,46 @@ static size_t    s_rdataSize  = 0;
 static uintptr_t s_dataBase   = 0;
 static size_t    s_dataSize   = 0;
 
+// ── Dynamic pattern storage ──────────────────────────────────────────
+
+#include <vector>
+static std::vector<DynamicPattern> s_dynamicPatterns;
+
+bool RegisterDynamicPattern(const DynamicPattern& pat) {
+    if (!pat.name || !pat.pattern || !pat.mask || pat.len == 0) return false;
+    // replace if same name exists
+    for (auto& p : s_dynamicPatterns) {
+        if (p.name && pat.name && strcmp(p.name, pat.name) == 0) {
+            p = pat;
+            return true;
+        }
+    }
+    s_dynamicPatterns.push_back(pat);
+    return true;
+}
+
+void ClearDynamicPatterns() {
+    s_dynamicPatterns.clear();
+}
+
+// Helper to find a dynamic pattern by name
+const DynamicPattern* FindDynamicPattern(const char* name) {
+    for (const auto& p : s_dynamicPatterns) {
+        if (p.name && name && strcmp(p.name, name) == 0) return &p;
+    }
+    return nullptr;
+}
+
+void EnumerateDynamicPatterns(void(*cb)(const DynamicPattern&)) {
+    for (const auto& p : s_dynamicPatterns) {
+        cb(p);
+    }
+}
+
+std::vector<DynamicPattern> GetDynamicPatternsCopy() {
+    return s_dynamicPatterns; // copies the struct (pointers are copied)
+}
+
 bool Init(uintptr_t steamClientBase) {
     if (!steamClientBase) return false;
     s_imageBase = steamClientBase;
@@ -198,14 +238,14 @@ uintptr_t FindFirstRipRelLeaTarget(uintptr_t start, size_t maxBytes) {
 
 // ── RTTI vtable resolution ────────────────────────────────────────────
 
-uintptr_t ResolveVtableByRtti(const char* className) {
-    if (!className || !s_imageBase) return 0;
+// Find the RTTI type descriptor name string in .data or .rdata.
+// MSVC TypeDescriptor layout: { void* pVFTable, void* spare, char name[] }
+// name is at offset +0x10 from the TypeDescriptor start.
+static const uint8_t* FindRttiNameStr(const char* className) {
+    if (!className || !s_imageBase) return nullptr;
 
     const size_t nameLen = strlen(className) + 1; // include NUL
 
-    // Step 1: find the RTTI type descriptor name string in .data or .rdata
-    // MSVC TypeDescriptor layout: { void* pVFTable, void* spare, char name[] }
-    // name is at offset +0x10 from the TypeDescriptor start.
     auto findNameInSection = [&](uintptr_t sStart, size_t sSize) -> const uint8_t* {
         if (!sStart || sSize < nameLen) return nullptr;
         const auto* mem = reinterpret_cast<const uint8_t*>(sStart);
@@ -222,6 +262,18 @@ uintptr_t ResolveVtableByRtti(const char* className) {
 
     const uint8_t* nameAddr = findNameInSection(s_dataBase, s_dataSize);
     if (!nameAddr) nameAddr = findNameInSection(s_rdataBase, s_rdataSize);
+    return nameAddr;
+}
+
+bool RttiNamePresent(const char* className) {
+    return FindRttiNameStr(className) != nullptr;
+}
+
+uintptr_t ResolveVtableByRtti(const char* className) {
+    if (!className || !s_imageBase) return 0;
+
+    // Step 1: find the RTTI type descriptor name string in .data or .rdata
+    const uint8_t* nameAddr = FindRttiNameStr(className);
     if (!nameAddr) {
         LOG("[SigScan-RTTI] type name '%s' not found", className);
         return 0;

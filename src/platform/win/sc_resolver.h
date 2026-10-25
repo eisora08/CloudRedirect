@@ -48,6 +48,7 @@ struct ResolvedAddrs {
     // ── Schema fetch ─────────────────────────────────────────────────
     uintptr_t getUserStatsDesc;           // CMsgClientGetUserStats body descriptor ptr
     uintptr_t getUserStatsVtable;         // CProtoBufMsg<CMsgClientGetUserStats> vtable
+    bool getUserStatsVtableRttiAbsent;    // wrapper RTTI type absent from image (by design)
 
     // ── Playtime response wrappers ───────────────────────────────────
     uintptr_t respDescriptor;             // CPlayer_GetLastPlayedTimes_Response descriptor ptr

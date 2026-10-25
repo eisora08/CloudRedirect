@@ -26,17 +26,37 @@ struct KvReference {
     uint32_t cache = 0;
 };
 
-// Follow the real RCX argument to ReadConfigU64, starting at a load of the
-// engine into nonvolatile RBX. Accept only straight-line argument setup and
-// one cache-lock call. Both cache LEAs must agree; RBX may not be overwritten.
+// Follow the argument setup of a UFS config reader that starts at a RIP-
+// relative load of the engine global into nonvolatile RBX:
+//
+//   mov  rbx, [rip+global]     ; 48 8B 1D xx xx xx xx
+//   lea  rcx, [rbx+cache]      ; 48 8D 8B xx xx xx xx   (app-info cache)
+//   call <cache lock>          ; E8 xx xx xx xx
+//   lea  r9, [rip+key]         ; 4C 8D 0D xx xx xx xx   ("quota"/"maxnumfiles")
+//   mov  [rsp+20h], <default>  ; 48 C7 44 24 20 ...  /  48-4C 89 44 24 20
+//   mov  r8d, 10               ; 41 B8 0A 00 00 00      (UFS section)
+//   lea  rcx, [rbx+cache]      ; 48 8D 8B xx xx xx xx
+//   call ReadConfigU64         ; E8 xx xx xx xx
+//
+// The callee's exact address is deliberately NOT required: ReadConfigU64 has
+// overload siblings sharing one prologue, and which sibling sits next to
+// GetAppInfo differs between builds. Instead the full argument structure must
+// be proven straight-line and the terminal call must land inside .text.
+// Callers additionally verify the key against .rdata strings and require two
+// agreeing readers, so a structural match cannot survive on a coincidence.
+// Only straight-line argument setup is accepted; branches and unknown
+// opcodes fail closed, and RBX may not be overwritten.
 inline bool DecodeKvReference(const uint8_t* p, size_t size, uintptr_t address,
-                              uintptr_t readConfigU64, KvReference& out) {
+                              uintptr_t textBase, uintptr_t textEnd,
+                              KvReference& out) {
     out = {};
-    if (!p || size < 7 || !readConfigU64 || std::memcmp(p, "\x48\x8B\x1D", 3)) return false;
+    if (!p || size < 7 || !textBase || textEnd <= textBase) return false;
+    if (std::memcmp(p, "\x48\x8B\x1D", 3)) return false;
+
     KvReference found;
     found.global = Relative(address + 7, p + 3);
     bool rcxCache = false, sectionUfs = false, lockSeen = false;
-    for (size_t i = 7; i < size && i < 96;) {
+    for (size_t i = 7; i < size && i < 256;) {
         const auto* q = p + i;
         const size_t n = size - i;
         if (n >= 7 && !std::memcmp(q, "\x48\x8D\x8B", 3)) {
@@ -49,7 +69,7 @@ inline bool DecodeKvReference(const uint8_t* p, size_t size, uintptr_t address,
             found.key = Relative(address + i + 7, q + 3);
             i += 7;
         } else if (n >= 6 && q[0] == 0x41 && q[1] == 0xB8) {
-            sectionUfs = U32(q + 2) == 10;
+            sectionUfs = U32(q + 2) == 10; // UFS section
             i += 6;
         } else if (n >= 9 && !std::memcmp(q, "\x48\xC7\x44\x24\x20", 5)) {
             i += 9; // default value, [rsp+20h]
@@ -58,15 +78,20 @@ inline bool DecodeKvReference(const uint8_t* p, size_t size, uintptr_t address,
             i += 5; // default value from a register
         } else if (n >= 5 && q[0] == 0xE8) {
             const uintptr_t target = Relative(address + i + 5, q + 1);
-            if (target == readConfigU64) {
-                if (!rcxCache || !lockSeen || !sectionUfs || !found.key) return false;
+            if (rcxCache && lockSeen && sectionUfs && found.key) {
+                // Every argument is proven straight-line; the reader call
+                // itself must target real code inside this module.
+                if (target < textBase || target >= textEnd) return false;
                 out = found;
                 return true;
             }
+            // Exactly one intermediate call (the cache lock) may precede the
+            // reader. It must directly follow the RCX cache setup and kills
+            // every volatile argument.
             if (!rcxCache || lockSeen) return false;
             lockSeen = true;
             rcxCache = sectionUfs = false;
-            found.key = 0; // volatile arguments do not survive a call
+            found.key = 0;
             i += 5;
         } else {
             // MOV/XOR register setup. Track volatile argument clobbers and
@@ -119,6 +144,54 @@ inline bool DecodeUserMap(const uint8_t* p, size_t n, uint32_t& map) {
         U32(p + 0x71) != base + 24 || U32(p + 0x97) != base) return false;
     map = base;
     return true;
+}
+
+// Pick the real GetAppInfo among several prologue-matching candidates by
+// proving caller intent: the true one is called with the app-info cache
+// member (engine + cacheOff) in RCX right before the call, i.e. the window
+// before the call site contains:
+//   lea rcx,[reg+disp32]  // REX 48..4B, 8D, modrm(mod=10, reg=001), disp32
+// (mod=10 forces disp32 for member offsets >= 0x80; SIB shifts disp32 by one).
+// Returns the index of the unique best candidate or -1 (no evidence, thin
+// evidence, or a tie at the top: fail closed). `*outConfirming` (optional)
+// receives the winning caller count.
+inline int ValidateByCacheCallers(const uint8_t* text, size_t size,
+                                  uintptr_t base, const uintptr_t* cands,
+                                  size_t nCands, uint32_t cacheOff,
+                                  unsigned minConfirming,
+                                  unsigned* outConfirming) {
+    if (outConfirming) *outConfirming = 0;
+    if (!text || !size || !cands || !nCands || nCands > 128 || !cacheOff)
+        return -1;
+    unsigned counts[128] = {};
+    for (size_t i = 0; i + 5 <= size; ++i) {
+        if (text[i] != 0xE8) continue;
+        const uintptr_t callee = Relative(base + i + 5, text + i + 1);
+        int idx = -1;
+        for (size_t c = 0; c < nCands; ++c)
+            if (cands[c] == callee) { idx = (int)c; break; }
+        if (idx < 0) continue;
+        const size_t w0 = (i >= 48) ? i - 48 : 0;
+        for (size_t b = w0; b + 7 <= i; ++b) {
+            const uint8_t rex = text[b];
+            if (rex < 0x48 || rex > 0x4B || text[b + 1] != 0x8D) continue;
+            const uint8_t modrm = text[b + 2];
+            if ((modrm & 0xF8) != 0x88) continue; // mod=10, reg=001 (rcx)
+            size_t disp = b + 3;
+            if ((modrm & 7) == 4) ++disp;         // SIB byte precedes disp32
+            if (disp + 4 > i) continue;
+            if (U32(text + disp) == cacheOff) { ++counts[idx]; break; }
+        }
+    }
+    int best = -1, second = -1;
+    for (size_t c = 0; c < nCands; ++c) {
+        if (best < 0 || counts[c] > counts[best]) { second = best; best = (int)c; }
+        else if (second < 0 || counts[c] > counts[second]) second = (int)c;
+    }
+    if (best < 0 || counts[best] < minConfirming) return -1;
+    if (second >= 0 && counts[best] == counts[second]) return -1; // tie
+    if (outConfirming) *outConfirming = counts[best];
+    return best;
 }
 
 } // namespace SteamEngineLayout

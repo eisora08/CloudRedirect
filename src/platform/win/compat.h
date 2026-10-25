@@ -94,6 +94,25 @@ uint32_t ScanAccountIdOffset(uintptr_t imageBase, size_t imageSize);
 // install work offline without weakening the unknown-build rule.
 bool IsAllowlisted(const std::string& sha256);
 
+// Load dynamic patterns from a JSON file located at
+// <steamRoot>/cloud_redirect/patterns/<sha256>.json.
+// The JSON format is an array of objects:
+//   { "name": "...", "pattern": "hexstring", "mask": "x?xx...", "len": N }
+// Returns true on success.
+bool LoadDynamicPatterns(const std::string& steamRoot, const std::string& sha256);
+
+// Export all patterns (dynamic + built‑in) to a JSON file at outPath.
+// Returns true on success.
+bool ExportPatterns(const std::string& outPath, const std::string& sha256);
+
+// Export full pattern set for a given image: includes dynamic patterns,
+// built‑ins, and concrete byte patterns for every critical symbol that was
+// resolved (functions/vtables). Writes TOML to outPath.
+bool ExportFullPatterns(uintptr_t imageBase,
+                        const ScResolver::ResolvedAddrs& resolved,
+                        const std::string& sha256,
+                        const std::string& outPath);
+
 // Merge a local report with the feed. strict=true means an absent feed keeps
 // the session in audit unless the build hash is in the compiled allowlist.
 // strict=false preserves the old behaviour for local-only setups.

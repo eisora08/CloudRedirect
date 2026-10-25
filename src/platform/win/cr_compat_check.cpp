@@ -79,6 +79,7 @@ void PrintUsage() {
 int wmain(int argc, wchar_t** argv) {
     std::filesystem::path dllPath;
     std::filesystem::path outPath;
+    std::filesystem::path emitPatternsPath;
     std::string channel = "stable";
     uint64_t steamVersion = 0;
 
@@ -105,6 +106,8 @@ int wmain(int argc, wchar_t** argv) {
             std::filesystem::path value;
             if (!next(value)) { PrintUsage(); return 3; }
             steamVersion = _wcstoui64(value.c_str(), nullptr, 10);
+        } else if (arg == L"--emit-patterns") {
+            if (!next(emitPatternsPath)) { PrintUsage(); return 3; }
         } else if (arg == L"--help" || arg == L"-h") {
             PrintUsage();
             return 0;
@@ -141,6 +144,12 @@ int wmain(int argc, wchar_t** argv) {
         return 3;
     }
 
+    // Mirror the DLL init order: per-build dynamic patterns must be registered
+    // before the resolver runs (local cache next to the DLL, else the
+    // steam-monitor pattern mirrors).
+    Compat::LoadDynamicPatterns(
+        std::filesystem::path(dllPath).parent_path().string(), sha256);
+
     const ScResolver::ResolvedAddrs resolved = ScResolver::Resolve(base);
     SteamMessageLayout::Layout layout;
     const bool layoutOk = Compat::ProbeMessageLayout(resolved, layout);
@@ -166,6 +175,15 @@ int wmain(int argc, wchar_t** argv) {
         out.write(json.data(), static_cast<std::streamsize>(json.size()));
         if (!out.good()) {
             std::fprintf(stderr, "cr_compat_check: write failed\n");
+            FreeLibrary(module);
+            return 3;
+        }
+    }
+
+    if (!emitPatternsPath.empty()) {
+        if (!Compat::ExportFullPatterns(base, resolved, sha256, emitPatternsPath.string())) {
+            std::fprintf(stderr, "cr_compat_check: failed to write pattern file %ls\n",
+                         emitPatternsPath.c_str());
             FreeLibrary(module);
             return 3;
         }

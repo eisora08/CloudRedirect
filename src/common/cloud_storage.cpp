@@ -1836,10 +1836,16 @@ bool PromoteStagedBatchForCommit(uint32_t accountId, uint32_t appId,
         return false;
     }
 
-    if (!g_provider || !g_provider->IsAuthenticated()) {
-        LOG("[CloudStorage] PromoteStagedBatch app %u batch %llu: cloud provider unavailable, failing batch",
+    // Local-only mode (no provider, or provider not authenticated): the staged
+    // blobs already live in local storage, which IS the source of truth.
+    // Validate they exist below, skip the cloud upload, and let the caller
+    // advance the local CN. Failing the batch here (the old behaviour) meant
+    // the CN never advanced, so every sync re-uploaded the same saves forever.
+    const bool localOnly = !g_provider || !g_provider->IsAuthenticated();
+    if (localOnly) {
+        LOG("[CloudStorage] PromoteStagedBatch app %u batch %llu: local-only mode -- "
+            "validating staged files locally, skipping cloud upload",
             appId, (unsigned long long)batchId);
-        return false;
     }
 
     // CAS: no rollback needed -- re-upload is idempotent, GC reclaims orphans.
@@ -1874,7 +1880,7 @@ bool PromoteStagedBatchForCommit(uint32_t accountId, uint32_t appId,
         batchShaHexes.push_back(std::move(shaHex));
     }
 
-    if (!batchItems.empty()) {
+    if (!batchItems.empty() && !localOnly) {
         // CAS dedup moved into UploadBatch's parallel workers (per-file, native-faithful).
         if (!g_provider->UploadBatch(batchItems)) {
             LOG("[CloudStorage] PromoteStagedBatch app %u batch %llu: batch upload failed",

@@ -5,7 +5,9 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <algorithm>
 #include <cstring>
+#include <vector>
 
 namespace ScResolver {
 
@@ -99,6 +101,14 @@ static uintptr_t ResolveServiceTransportVtable() {
 // readers. A stale layout constant must not prevent discovery (or be combined
 // with a newly discovered global).
 static void ResolveGlobalEngine(uintptr_t scBase, ResolvedAddrs& r) {
+    // No dynamic-pattern hook here, deliberately: globalEngine is the ADDRESS
+    // of a .data pointer whose stored value is a live object pointer, so it
+    // has no stable byte signature and a data pattern could never be matched
+    // by the code-range scans the other dynamic hooks use. Discovery below
+    // walks actual UFS quota readers (semantic decoding), which keeps working
+    // across builds and is the recovery path for this symbol.
+
+    // Fallback to UFS‑based resolution
     using namespace SteamEngineLayout;
     const auto* text = reinterpret_cast<const uint8_t*>(SigScanner::GetTextBase());
     const size_t textSize = SigScanner::GetTextSize();
@@ -109,10 +119,11 @@ static void ResolveGlobalEngine(uintptr_t scBase, ResolvedAddrs& r) {
     KvReference agreed;
     unsigned keys = 0, matches = 0;
     __try {
-        for (size_t i = 0; i + 7 <= textSize && r.readConfigU64; ++i) {
+        for (size_t i = 0; i + 7 <= textSize; ++i) {
             KvReference candidate;
-            if (!DecodeKvReference(text + i, textSize - i,
-                                   SigScanner::GetTextBase() + i, r.readConfigU64, candidate)) continue;
+            if (!DecodeKvReference(text + i, textSize - i, SigScanner::GetTextBase() + i,
+                                   SigScanner::GetTextBase(), SigScanner::GetTextBase() + textSize,
+                                   candidate)) continue;
             if (candidate.global < data || candidate.global + sizeof(void*) > dataEnd ||
                 candidate.global % alignof(void*) || candidate.key < rdata ||
                 candidate.key >= rdataEnd) continue;
@@ -120,6 +131,9 @@ static void ResolveGlobalEngine(uintptr_t scBase, ResolvedAddrs& r) {
             if (rdataEnd - candidate.key >= 6 && !std::memcmp((void*)candidate.key, "quota", 6)) key = 1;
             if (rdataEnd - candidate.key >= 12 && !std::memcmp((void*)candidate.key, "maxnumfiles", 12)) key = 2;
             if (!key) continue;
+            LOG("[Resolver] UFS candidate #%u: global=0x%llX cache=0x%X key='%s' (keyType=%u)",
+                matches+1, (unsigned long long)candidate.global, candidate.cache,
+                reinterpret_cast<const char*>(candidate.key), key);
             if (matches && (agreed.global != candidate.global || agreed.cache != candidate.cache)) {
                 LOG("[Resolver] GlobalEngine: conflicting UFS readers; disabled");
                 return;
@@ -130,7 +144,8 @@ static void ResolveGlobalEngine(uintptr_t scBase, ResolvedAddrs& r) {
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
     if (matches < 2 || keys != 3) {
-        LOG("[Resolver] GlobalEngine: no agreeing quota/maxnumfiles readers; disabled");
+        LOG("[Resolver] GlobalEngine: UFS failed – matches=%u keys=0x%X (need matches>=2 and keys==3)",
+            matches, keys);
         return;
     }
     r.globalEngine = agreed.global;
@@ -485,9 +500,30 @@ static uintptr_t ResolveKvGetUint64(uintptr_t /*kvFindKeyAddr*/) {
 }
 
 // ── GetAppInfo, GetSection, ReadConfigU64 ─────────────────────────────
-// GetAppInfo has a distinctive prologue: mov r8d,[rcx+68h]; mov r9d,edx; cmp r8d,0FFFFFFFFh
-//   44 8B 41 68  44 8B CA  41 83 F8 FF
-static uintptr_t ResolveGetAppInfo() {
+// GetAppInfo has a distinctive prologue: mov r8d,[rcx+field]; mov r9d,edx; cmp r8d,-1
+//   44 8B 41 xx        mov r8d,[rcx+disp8]   (stable: 68h, beta 1792618285: 28h)
+//   44 8B 81 xx xx 00 00  mov r8d,[rcx+disp32]
+//   44 8B CA           mov r9d,edx
+//   41 83 F8 FF        cmp r8d,-1
+// The field displacement moves between builds, so beyond the exact stable
+// signature the fallback matches both load encodings with a masked
+// displacement and then proves the candidate with ValidateByCacheCallers:
+// callers of the real GetAppInfo load the app-info cache member
+// (engine + appInfoCacheOff) into RCX right before the call.
+static uintptr_t ResolveGetAppInfo(uint32_t appInfoCacheOff) {
+    // Try dynamic pattern first
+    const SigScanner::DynamicPattern* dyn = SigScanner::FindDynamicPattern("GetAppInfo");
+    if (dyn) {
+        uintptr_t dynAddr = SigScanner::FindPatternInRange(
+            SigScanner::GetTextBase(), SigScanner::GetTextSize(),
+            dyn->pattern, dyn->mask, dyn->len);
+        if (dynAddr) {
+            LOG("[Resolver] GetAppInfo @ %p (RVA 0x%llX) via dynamic pattern",
+                (void*)dynAddr, (uint64_t)(dynAddr - SigScanner::GetImageBase()));
+            return dynAddr;
+        }
+    }
+    // Fallback to built‑in signature
     static const uint8_t pat[] = {
         0x44, 0x8B, 0x41, 0x68,       // mov r8d, [rcx+68h]
         0x44, 0x8B, 0xCA,             // mov r9d, edx
@@ -496,12 +532,67 @@ static uintptr_t ResolveGetAppInfo() {
     static const char mask[] = "xxxxxxxxxxx";
 
     uintptr_t result = SigScanner::FindPattern(pat, mask, 11);
-    if (result)
+    if (result) {
         LOG("[Resolver] GetAppInfo @ %p (RVA 0x%llX) via signature",
             (void*)result, (uint64_t)(result - SigScanner::GetImageBase()));
-    else
-        LOG("[Resolver] GetAppInfo: signature not found");
-    return result;
+        return result;
+    }
+
+    // Masked fallback: the displacement varies per build, so match both
+    // encodings of the first load and discriminate by caller evidence.
+    static const uint8_t pat8[] = {
+        0x44, 0x8B, 0x41, 0x00,       // mov r8d, [rcx+disp8]
+        0x44, 0x8B, 0xCA,             // mov r9d, edx
+        0x41, 0x83, 0xF8, 0xFF,       // cmp r8d, -1
+    };
+    // "xxx?" + 7 x's = 11 chars, wildcard = the disp8 operand byte.
+    static const char mask8[] = "xxx?xxxxxxx";
+    static const uint8_t pat32[] = {
+        0x44, 0x8B, 0x81, 0x00, 0x00, 0x00, 0x00, // mov r8d, [rcx+disp32]
+        0x44, 0x8B, 0xCA,             // mov r9d, edx
+        0x41, 0x83, 0xF8, 0xFF,       // cmp r8d, -1
+    };
+    // "xxx" + "??" + 9 x's = 14 chars, wildcards = the disp32 operand bytes.
+    static const char mask32[] = "xxx??xxxxxxxxx";
+
+    const uintptr_t textBase = SigScanner::GetTextBase();
+    const size_t textSize = SigScanner::GetTextSize();
+    static_assert(sizeof(mask8) - 1 == sizeof(pat8), "mask8 length");
+    static_assert(sizeof(mask32) - 1 == sizeof(pat32), "mask32 length");
+    std::vector<uintptr_t> cands;
+    auto collect = [&](const uint8_t* p, const char* m, size_t len) {
+        uintptr_t pos = textBase;
+        while (pos + len <= textBase + textSize) {
+            uintptr_t hit = SigScanner::FindPatternInRange(
+                pos, textBase + textSize - pos, p, m, len);
+            if (!hit) break;
+            if (std::find(cands.begin(), cands.end(), hit) == cands.end())
+                cands.push_back(hit);
+            pos = hit + 1;
+        }
+    };
+    collect(pat8, mask8, sizeof(pat8));
+    collect(pat32, mask32, sizeof(pat32));
+
+    unsigned confirming = 0;
+    int best = -1;
+    if (appInfoCacheOff && !cands.empty() && cands.size() <= 128) {
+        best = SteamEngineLayout::ValidateByCacheCallers(
+            reinterpret_cast<const uint8_t*>(textBase), textSize, textBase,
+            cands.data(), cands.size(), appInfoCacheOff, 3, &confirming);
+    }
+    if (best >= 0) {
+        result = cands[best];
+        LOG("[Resolver] GetAppInfo @ %p (RVA 0x%llX) via masked signature "
+            "(%d candidates, %u cache-confirmed callers)",
+            (void*)result, (uint64_t)(result - SigScanner::GetImageBase()),
+            (int)cands.size(), confirming);
+        return result;
+    }
+    LOG("[Resolver] GetAppInfo: signature not found (%d masked candidates, "
+        "cache offset 0x%X: no unique cache-confirmed candidate)",
+        (int)cands.size(), appInfoCacheOff);
+    return 0;
 }
 
 // GetSection: sub rsp,28h; lea eax,[edx-2]; cmp eax,12h
@@ -637,12 +728,15 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
     r.ccmInterfaceVtable = ResolveCCMInterfaceVtable();
     r.serviceTransportVtable = ResolveServiceTransportVtable();
 
-    // Resolve the KV read chain before deriving the engine/cache pair from
-    // its callers. No engine pointer is dereferenced during resolution.
-    r.getAppInfo    = ResolveGetAppInfo();
+    // Resolve the engine/cache pair first: the GetAppInfo masked fallback
+    // proves candidates by counting callers that pass the app-info cache in
+    // RCX, and ReadConfigU64's proximity anchor needs GetAppInfo. The UFS
+    // decode is structural and depends on neither. No engine pointer is
+    // dereferenced during resolution.
+    ResolveGlobalEngine(steamClientBase, r);
+    r.getAppInfo    = ResolveGetAppInfo(r.engineOffAppInfoCache);
     r.getSection    = ResolveGetSection();
     r.readConfigU64 = ResolveReadConfigU64(r.getAppInfo);
-    ResolveGlobalEngine(steamClientBase, r);
     ResolveCurrentUserOffsets(r);
 
     // Phase 3: Protobuf helpers (signature-based)
@@ -676,7 +770,19 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
     // followed immediately by a mov from the global engine pointer.
     // But this prologue isn't unique enough alone. We use the full 9 bytes + the fact
     // that the very next instruction loads g_pCSteamEngine (which we already resolved).
-    if (r.globalEngine) {
+    // Try dynamic pattern first.
+    const SigScanner::DynamicPattern* dynFlush = SigScanner::FindDynamicPattern("FlushAppMinutesPlayed");
+    if (dynFlush) {
+        uintptr_t dynAddr = SigScanner::FindPatternInRange(
+            SigScanner::GetTextBase(), SigScanner::GetTextSize(),
+            dynFlush->pattern, dynFlush->mask, dynFlush->len);
+        if (dynAddr) {
+            r.flushAppMinutesPlayed = dynAddr;
+            LOG("[Resolver] FlushAppMinutesPlayed @ %p (RVA 0x%llX) via dynamic pattern",
+                (void*)dynAddr, (uint64_t)(dynAddr - steamClientBase));
+        }
+    }
+    if (!r.flushAppMinutesPlayed && r.globalEngine) {
         // Scan .text for: 40 55 57 41 56 48 83 EC 30 48 8B 05 XX XX XX XX
         // where the XX bytes, when decoded as rip+disp, point to r.globalEngine.
         static const uint8_t pat[] = {
@@ -946,13 +1052,27 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
     }
 
     // Phase 16: RTTI vtables for protobuf message wrappers
-    r.getUserStatsVtable = SigScanner::ResolveVtableByRtti(
-        ".?AV?$CProtoBufMsg@VCMsgClientGetUserStats@@@@");
-    if (r.getUserStatsVtable)
-        LOG("[Resolver] GetUserStatsVtable @ %p (RVA 0x%llX) via RTTI",
-            (void*)r.getUserStatsVtable, (uint64_t)(r.getUserStatsVtable - steamClientBase));
-    else
-        LOG("[Resolver] GetUserStatsVtable: RTTI not found");
+    // No dynamic-pattern hook here: a .rdata vtable capture consists of
+    // absolute pointers that base relocations rewrite per process, so it can
+    // never match across ASLR bases -- RTTI decoding is the stable path.
+    if (!r.getUserStatsVtable) {
+        r.getUserStatsVtable = SigScanner::ResolveVtableByRtti(
+            ".?AV?$CProtoBufMsg@VCMsgClientGetUserStats@@@@");
+        if (r.getUserStatsVtable)
+            LOG("[Resolver] GetUserStatsVtable @ %p (RVA 0x%llX) via RTTI",
+                (void*)r.getUserStatsVtable, (uint64_t)(r.getUserStatsVtable - steamClientBase));
+        else if (!SigScanner::RttiNamePresent(".?AV?$CProtoBufMsg@VCMsgClientGetUserStats@@@@")) {
+            // Some builds never instantiate this wrapper (schema fetch moved or
+            // removed). No vtable exists to steal; schema auto-fetch degrades
+            // gracefully at runtime, so report it as absent by design rather
+            // than a resolution failure.
+            r.getUserStatsVtableRttiAbsent = true;
+            LOG("[Resolver] GetUserStatsVtable: RTTI type absent from image "
+                "(build does not instantiate the wrapper; schema auto-fetch unavailable)");
+        } else {
+            LOG("[Resolver] GetUserStatsVtable: RTTI type present but vtable not resolved");
+        }
+    }
 
     r.respWrapperVtable = SigScanner::ResolveVtableByRtti(
         ".?AV?$CProtoBufMsg@VCPlayer_GetLastPlayedTimes_Response@@@@");

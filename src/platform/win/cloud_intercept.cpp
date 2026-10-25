@@ -4212,8 +4212,8 @@ static void TryAutoUpdateDll() {
     while (!remoteHash.empty() &&
            (remoteHash.back() == '\n' || remoteHash.back() == '\r' || remoteHash.back() == ' '))
         remoteHash.pop_back();
-    remoteHash = LowerAscii(remoteHash);
-    if (!IsSha256Hex(remoteHash)) {
+    remoteHash = UpdateUtil::LowerAscii(remoteHash);
+    if (!UpdateUtil::IsSha256Hex(remoteHash)) {
         LOG("[AutoUpdate] Invalid published SHA-256 for %s (%zu chars); "
             "refusing unverified update", bestTag.c_str(), remoteHash.size());
         WinHttpCloseHandle(hSession);
@@ -4363,6 +4363,15 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
     else
         LOG("Steam version: UNKNOWN (manifest unreadable)");
 
+    // Hash the client and load the per-build dynamic pattern set BEFORE the
+    // resolver runs: ScResolver::Resolve consults FindDynamicPattern for the
+    // symbols whose built-in signatures break on Steam updates. Registering the
+    // patterns after resolution would leave them unseen by the resolver.
+    g_compatSha = Sha256File(g_steamPath + "steamclient64.dll");
+    // Local cache first: <steamPath>\cloud_redirect\patterns\<sha>.toml; falls
+    // back to this repository's pattern-branch mirrors and caches the download.
+    Compat::LoadDynamicPatterns(g_steamPath, g_compatSha);
+
     // Run auto-resolver: resolves steamclient64 function/global addresses via
     // pattern scanning, RTTI walks, and string xrefs. Must run before any hooks
     // or function-pointer resolution. Failure leaves addresses at zero and the
@@ -4389,7 +4398,6 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
             LOG("[Compat] message layout probe failed");
     }
 
-    g_compatSha = Sha256File(g_steamPath + "steamclient64.dll");
     EvaluateCompat(false, Compat::Status::Audit);
 
     // Auto-detect namespace apps from {steamPath}\config\stplug-in\*.lua, restricted to self-unlocking luas (base-game addappid for own id).

@@ -2230,6 +2230,17 @@ RpcResult HandleCompleteBatch(uint32_t appId, const std::vector<PB::Field>& reqB
             return;
         }
 
+        // Local-only mode: there is no cloud state to publish; the local CN
+        // advance above is the source of truth. Skip the retry loop entirely so
+        // we don't burn the retry window or leave a false "upload pending"
+        // marker for a batch that fully completed locally.
+        if (!CloudStorage::IsCloudActive()) {
+            LOG("[NS] CompleteBatch(pub) app %u: local-only mode -- cloud publish skipped",
+                appId);
+            publishPromise.set_value();
+            return;
+        }
+
         bool publishSucceeded = false;
         constexpr int kMaxAttempts = 4;
         constexpr int kBaseDelayMs = 2000;

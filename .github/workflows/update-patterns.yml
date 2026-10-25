@@ -1,0 +1,163 @@
+name: Update patterns
+
+# Generates the per-build pattern file ([[patterns]] TOML, first-match
+# verified .text captures -- GetAppInfo, FlushAppMinutesPlayed and the rest
+# of the critical set) for the runner's CURRENT Steam build and publishes
+# it to this repository's 'pattern' branch as patterns/<sha>.toml.
+#
+# The DLL's LoadDynamicPatterns() downloads exactly that path. The branch is
+# owned by this repository, so nothing wipes it (steam-monitor's mirrored
+# 'pattern' branch force-replaces its tree every 10 min from its upstream and
+# serves a different format/content set -- it cannot host these files).
+#
+# Pushes with GITHUB_TOKEN (no PAT required).
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Daily: Steam updates happen on Valve's schedule, not on ours. The
+    # push trigger alone would never cover a new client build that lands
+    # without any code change here.
+    - cron: "17 6 * * *"
+  push:
+    branches: [master]
+    paths:
+      - 'src/**'
+      - 'CMakeLists.txt'
+
+permissions:
+  contents: write
+
+jobs:
+  update-patterns:
+    name: Generate & push pattern for new Steam build
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout (with write token)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Visual Studio
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure CMake
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build cr_compat_check
+        run: cmake --build build --config Release --target cr_compat_check
+
+      # The image's Steam is a baked snapshot; without this step the workflow
+      # would keep generating patterns for an ancient build nobody runs.
+      # Best-effort: if the client never updates, we publish what the image has.
+      - name: Update runner Steam client (best effort)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $steamDir = $env:ProgramFiles(x86) + "\Steam"
+          if (-not (Test-Path "$steamDir\steamclient64.dll")) {
+            $steamDir = $env:ProgramFiles + "\Steam"
+          }
+          if (-not (Test-Path "$steamDir\steamclient64.dll")) {
+            Write-Host "::notice::Steam not present on this runner image; nothing to do"
+            echo "present=false" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          echo "present=true" >> $env:GITHUB_OUTPUT
+
+          $dll = "$steamDir\steamclient64.dll"
+          $lastWrite = (Get-Item $dll).LastWriteTimeUtc
+          try {
+            Start-Process "$steamDir\steam.exe" -ArgumentList '-silent'
+          } catch {
+            Write-Host "::warning::could not launch steam.exe: $_"
+          }
+          $deadline = (Get-Date).AddMinutes(8)
+          $stableSince = $null
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 20
+            try { $now = (Get-Item $dll).LastWriteTimeUtc } catch { continue }
+            if ($now -gt $lastWrite) {
+              $lastWrite = $now
+              $stableSince = $null
+              Write-Host "steamclient64.dll changed; waiting for the update to settle"
+              continue
+            }
+            if (-not $stableSince) { $stableSince = Get-Date; continue }
+            if (((Get-Date) - $stableSince).TotalSeconds -ge 60) { break }
+          }
+          Get-Process steam -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 5
+
+      - name: Determine Steam client DLL
+        id: steam
+        shell: pwsh
+        run: |
+          $steamDir = $env:ProgramFiles(x86) + "\Steam"
+          if (-not (Test-Path "$steamDir\steamclient64.dll")) {
+            $steamDir = $env:ProgramFiles + "\Steam"
+          }
+          if (-not (Test-Path "$steamDir\steamclient64.dll")) {
+            Write-Error "steamclient64.dll not found"
+            exit 1
+          }
+          $dll = "$steamDir\steamclient64.dll"
+          $sha = (Get-FileHash $dll -Algorithm SHA256).Hash.ToLower()
+          $ver = 0
+          $manifest = "$steamDir\package\steam_client_win64.manifest"
+          if (Test-Path $manifest) {
+            $ver = [int64]((Get-Content $manifest -Raw) -match '"version"\s+"(\d+)"' | Out-Null; $matches[1])
+          }
+          Write-Output "dll=$dll"
+          Write-Output "sha=$sha"
+          Write-Output "ver=$ver"
+          echo "dll=$dll" >> $env:GITHUB_OUTPUT
+          echo "sha=$sha" >> $env:GITHUB_OUTPUT
+          echo "ver=$ver" >> $env:GITHUB_OUTPUT
+
+      - name: Run compat check
+        id: check
+        shell: pwsh
+        run: |
+          $dll = "${{ steps.steam.outputs.dll }}"
+          $sha = "${{ steps.steam.outputs.sha }}"
+          $ver = "${{ steps.steam.outputs.ver }}"
+          $outJson = "compat_${sha}.json"
+          $patFile = "pattern_${sha}.toml"
+          .\build\Release\cr_compat_check.exe --dll $dll --out $outJson --channel stable --version $ver --emit-patterns $patFile
+          $code = $LASTEXITCODE
+          $report = Get-Content $outJson -Raw | ConvertFrom-Json
+          echo "status=$($report.status)" >> $env:GITHUB_OUTPUT
+          echo "sha=$sha" >> $env:GITHUB_OUTPUT
+          echo "patFile=$patFile" >> $env:GITHUB_OUTPUT
+          exit $code
+
+      - name: Publish pattern (patterns/<sha>.toml on this repo's pattern branch)
+        if: steps.check.outputs.status == 'full'
+        shell: pwsh
+        run: |
+          $sha = "${{ steps.check.outputs.sha }}"
+          $patFile = "${{ steps.check.outputs.patFile }}"
+          New-Item -ItemType Directory -Force -Path patterns | Out-Null
+          Copy-Item $patFile "patterns\$sha.toml" -Force
+          git config user.name "pattern bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add "patterns/$sha.toml"
+          if (git diff --cached --quiet) {
+            Write-Host "Pattern for $sha already present"
+            exit 0
+          }
+          git commit -m "pattern: add $sha"
+          # pattern branch == master + the pattern file; force-with-lease in
+          # case the branch tip has diverged from an older master.
+          $has = git ls-remote --exit-code --heads origin refs/heads/pattern
+          if ($LASTEXITCODE -eq 0) {
+            $lease = git rev-parse origin/pattern
+            git push --force-with-lease="refs/heads/pattern:$lease" origin HEAD:pattern
+          } else {
+            git push origin HEAD:pattern
+          }

@@ -50,34 +50,37 @@ static void Fixtures() {
         "e8 f9 8e a8 ff 4c 8d 0d e2 29 85 00 48 c7 44 24 20 00 00 00 00 "
         "41 b8 0a 00 00 00 48 8d 8b 08 12 00 00 8b d7 e8 55 a8 a8 ff");
     KvReference out;
-    CHECK(DecodeKvReference(kv.data(), kv.size(), 0xA3EC21, 0x4C94B0, out));
+    CHECK(DecodeKvReference(kv.data(), kv.size(), 0xA3EC21, 0x400000, 0x500000, out));
     CHECK(out.global == 0x181D008 && out.cache == 0x1208 && out.key == 0x1291620);
-    CHECK(DecodeKvReference(kv.data(), kv.size(), 0x7FF000A3EC21ULL, 0x7FF0004C94B0ULL, out));
+    CHECK(DecodeKvReference(kv.data(), kv.size(), 0x7FF000A3EC21ULL,
+                            0x7FF000400000ULL, 0x7FF000500000ULL, out));
     CHECK(out.global == 0x7FF00181D008ULL); // relocated module
-    CHECK(!DecodeKvReference(nullptr, kv.size(), 0xA3EC21, 0x4C94B0, out));
-    CHECK(!DecodeKvReference(kv.data(), kv.size(), 0xA3EC21, 0, out));
+    CHECK(!DecodeKvReference(nullptr, kv.size(), 0xA3EC21, 0x400000, 0x500000, out));
+    CHECK(!DecodeKvReference(kv.data(), kv.size(), 0xA3EC21, 0, 0, out)); // empty range
+    // The terminal reader call (target 0x4C94B0) must land inside .text
+    CHECK(!DecodeKvReference(kv.data(), kv.size(), 0xA3EC21, 0x4C0000, 0x4C9000, out));
     for (size_t n = 0; n < kv.size(); ++n)
-        CHECK(!DecodeKvReference(kv.data(), n, 0xA3EC21, 0x4C94B0, out));
+        CHECK(!DecodeKvReference(kv.data(), n, 0xA3EC21, 0x400000, 0x500000, out));
 
     auto changed = kv;
     Put32(changed, 13, 0xE68);
     Put32(changed, 47, 0xE68);
-    CHECK(DecodeKvReference(changed.data(), changed.size(), 0xA3EC21, 0x4C94B0, out));
+    CHECK(DecodeKvReference(changed.data(), changed.size(), 0xA3EC21, 0x400000, 0x500000, out));
     CHECK(out.cache == 0xE68); // operand extraction, not a new fixed offset
     Put32(changed, 47, 0x1208);
-    CHECK(!DecodeKvReference(changed.data(), changed.size(), 0xA3EC21, 0x4C94B0, out));
+    CHECK(!DecodeKvReference(changed.data(), changed.size(), 0xA3EC21, 0x400000, 0x500000, out));
     changed = kv;
     changed[9] = 0xD8; // overwrite RBX between load and use
-    CHECK(!DecodeKvReference(changed.data(), changed.size(), 0xA3EC21, 0x4C94B0, out));
+    CHECK(!DecodeKvReference(changed.data(), changed.size(), 0xA3EC21, 0x400000, 0x500000, out));
     changed = kv;
     changed[7] = 0xEB; // branch: no linear dataflow proof
-    CHECK(!DecodeKvReference(changed.data(), changed.size(), 0xA3EC21, 0x4C94B0, out));
+    CHECK(!DecodeKvReference(changed.data(), changed.size(), 0xA3EC21, 0x400000, 0x500000, out));
     changed = kv;
     changed[40] = 9; // section must be UFS
-    CHECK(!DecodeKvReference(changed.data(), changed.size(), 0xA3EC21, 0x4C94B0, out));
+    CHECK(!DecodeKvReference(changed.data(), changed.size(), 0xA3EC21, 0x400000, 0x500000, out));
     changed = kv;
     changed[53] = 0xE9; // tail jump/unknown form must not count as a verified call
-    CHECK(!DecodeKvReference(changed.data(), changed.size(), 0xA3EC21, 0x4C94B0, out));
+    CHECK(!DecodeKvReference(changed.data(), changed.size(), 0xA3EC21, 0x400000, 0x500000, out));
 
     // Actual user-map lookup at RVA 990600, including all return paths.
     const auto lookup = Bytes(
@@ -104,6 +107,68 @@ static void Fixtures() {
     badMap = lookup;
     badMap[0x9F] = 0x10; // wrong pointer offset in each entry
     CHECK(!DecodeUserMap(badMap.data(), badMap.size(), map));
+}
+
+static void CallerValidation() {
+    using namespace SteamEngineLayout;
+    // Synthetic .text: two prologue candidates; only callers that load the
+    // app-info cache member into RCX within the 48-byte window before the
+    // call provide evidence. Call sites are spaced so windows never overlap.
+    const uintptr_t base = 0x400000;
+    std::vector<uint8_t> buf(0x2C0, 0x90);
+    const size_t A = 0x10, B = 0x200;
+    auto leaRcx = [&](size_t at, uint32_t disp, bool sib) {
+        if (sib) { // lea rcx,[r12+disp32]: 4A 8D 8C 24 xx xx xx xx
+            buf[at] = 0x4A; buf[at + 1] = 0x8D; buf[at + 2] = 0x8C; buf[at + 3] = 0x24;
+            Put32(buf, at + 4, disp);
+        } else {   // lea rcx,[rbx+disp32]: 48 8D 8B xx xx xx xx
+            buf[at] = 0x48; buf[at + 1] = 0x8D; buf[at + 2] = 0x8B;
+            Put32(buf, at + 3, disp);
+        }
+    };
+    auto call = [&](size_t at, size_t target) {
+        buf[at] = 0xE8;
+        Put32(buf, at + 1, static_cast<uint32_t>((base + target) - (base + at + 5)));
+    };
+    const uintptr_t cands[2] = { base + A, base + B };
+    unsigned n = 0;
+    auto run = [&](uint32_t cacheOff, unsigned minConf) {
+        return ValidateByCacheCallers(buf.data(), buf.size(), base, cands, 2,
+                                      cacheOff, minConf, &n);
+    };
+
+    CHECK(ValidateByCacheCallers(nullptr, buf.size(), base, cands, 2, 0x1290, 3, nullptr) == -1);
+    CHECK(ValidateByCacheCallers(buf.data(), buf.size(), base, cands, 0, 0x1290, 3, &n) == -1);
+    CHECK(run(0x1290, 3) == -1); // no calls at all
+
+    leaRcx(0x20, 0x1290, false); call(0x27, A);
+    CHECK(run(0x1290, 3) == -1); // thin evidence
+    CHECK(run(0, 3) == -1);      // cache offset unknown
+
+    leaRcx(0x60, 0x1290, true);  call(0x68, A);   // SIB form counts
+    leaRcx(0xA0, 0x1290, false); call(0xA7, A);
+    leaRcx(0xE0, 0x999, false);  call(0xE7, A);   // wrong member: no evidence
+    leaRcx(0x130, 0x999, false); call(0x137, B);
+    leaRcx(0x170, 0x999, false); call(0x177, B);
+    CHECK(run(0x1290, 3) == 0);
+    CHECK(n == 3);
+
+    leaRcx(0xF0, 0x1290, false); call(0x121, A);  // LEA further than 48 bytes back
+    CHECK(run(0x1290, 3) == 0);
+    CHECK(n == 3);
+
+    leaRcx(0x1B0, 0x1290, false); call(0x1B7, B);
+    leaRcx(0x1F0, 0x1290, false); call(0x1F7, B);
+    CHECK(run(0x1290, 3) == 0);   // B still behind
+    CHECK(n == 3);
+
+    leaRcx(0x230, 0x1290, true);  call(0x238, B);
+    CHECK(run(0x1290, 3) == -1);  // tie at the top: fail closed
+
+    leaRcx(0x270, 0x1290, false); call(0x277, B);
+    CHECK(run(0x1290, 3) == 1);
+    CHECK(n == 4);
+    CHECK(ValidateByCacheCallers(buf.data(), buf.size(), base, cands, 0, 0x1290, 3, &n) == -1);
 }
 
 #ifdef _WIN32
@@ -170,6 +235,7 @@ static void Smoke(const wchar_t* path) {
 
 int wmain(int argc, wchar_t** argv) {
     Fixtures();
+    CallerValidation();
     if (argc > 1) Smoke(argv[1]);
     std::printf("steam_resolver_tests: %d failures\n", failures);
     return failures ? 1 : 0;
@@ -177,6 +243,7 @@ int wmain(int argc, wchar_t** argv) {
 #else
 int main() {
     Fixtures();
+    CallerValidation();
     std::printf("steam_resolver_tests: %d failures\n", failures);
     return failures ? 1 : 0;
 }

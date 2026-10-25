@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <vector>
 
 namespace SigScanner {
 
@@ -22,6 +23,33 @@ uintptr_t FindPattern(const uint8_t* pattern, const char* mask, size_t patternLe
 // Scan arbitrary memory range with mask.
 uintptr_t FindPatternInRange(uintptr_t start, size_t size,
                              const uint8_t* pattern, const char* mask, size_t patternLen);
+
+// ── Dynamic pattern registration ──────────────────────────────────────
+struct DynamicPattern {
+    const char* name;                // unique identifier
+    const uint8_t* pattern;          // raw bytes
+    const char* mask;                // "x"/"?" mask, same length as pattern
+    size_t len;                      // pattern length
+    uintptr_t (*post)(uintptr_t);    // optional post‑process callback, may be nullptr
+};
+
+// Register a pattern that will be tried by the resolver before built‑in patterns.
+// Returns true on success.
+bool RegisterDynamicPattern(const DynamicPattern& pat);
+
+// Remove all dynamic patterns (called on shutdown / re‑init).
+void ClearDynamicPatterns();
+
+// Find a registered dynamic pattern by name. Returns nullptr if not found.
+const DynamicPattern* FindDynamicPattern(const char* name);
+
+// Enumerate all registered dynamic patterns. The callback receives a const reference
+// to each DynamicPattern; the callback must not store the pointers beyond the call.
+using DynamicPatternCallback = void(*)(const DynamicPattern&);
+void EnumerateDynamicPatterns(void(*cb)(const DynamicPattern&));
+
+// Return a copy of all registered dynamic patterns.
+std::vector<DynamicPattern> GetDynamicPatternsCopy();
 
 // ── Instruction operand extraction ────────────────────────────────────
 
@@ -55,6 +83,11 @@ uintptr_t FindFirstRipRelLeaTarget(uintptr_t start, size_t maxBytes);
 // className: decorated RTTI name, e.g. ".?AVCCMInterface@@"
 // Returns absolute address of the vtable (first function pointer slot), or 0.
 uintptr_t ResolveVtableByRtti(const char* className);
+
+// True when the RTTI type name string exists anywhere in .data/.rdata.
+// Lets callers distinguish "class absent from this build by design" from
+// "class present but resolution failed".
+bool RttiNamePresent(const char* className);
 
 // ── Utility ───────────────────────────────────────────────────────────
 
