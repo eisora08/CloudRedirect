@@ -81,6 +81,13 @@ jobs:
               $proc.WaitForExit(300000)
               Write-Host "SteamSetup exited with code $($proc.ExitCode)"
               Start-Sleep -Seconds 10
+              if (-not (Test-Path 'C:\Steam\steam.exe')) {
+                $found = Get-ChildItem -Path 'C:\' -Filter 'steam.exe' -Recurse -ErrorAction SilentlyContinue -Depth 4 | Select-Object -First 1
+                if ($found) {
+                  $steamDir = $found.DirectoryName
+                  Write-Host "Steam found at $steamDir (installer ignored /D=)"
+                }
+              }
             } catch {
               Write-Host "::warning::SteamSetup failed: $_"
             }
