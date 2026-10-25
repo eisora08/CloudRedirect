@@ -45,7 +45,9 @@ jobs:
 
       - name: Configure CMake
         run: |
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          # No -G: the runner image's VS major version changes (17, 18, ...),
+          # let CMake pick the newest installed generator; -A pins x64.
+          cmake -S . -B build -A x64
 
       - name: Build cr_compat_check
         run: cmake --build build --config Release --target cr_compat_check
