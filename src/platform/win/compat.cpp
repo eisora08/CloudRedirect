@@ -280,9 +280,9 @@ Report BuildStatic(uintptr_t imageBase, size_t imageSize,
     AddField(report, "image", imageOk,
              kCloud | kManifest | kPlaytime | kKv, "pe");
 
-    AddField(report, "ccmInterfaceVtable", InRdata(r.ccmInterfaceVtable),
+    AddField(report, "ccmInterfaceVtable", InImage(r.ccmInterfaceVtable),
              kCloud, "vtable");
-    AddField(report, "serviceTransportVtable", InRdata(r.serviceTransportVtable),
+    AddField(report, "serviceTransportVtable", InImage(r.serviceTransportVtable),
              kCloud, "vtable");
     AddField(report, "globalEngine", InData(r.globalEngine),
              kCloud | kPlaytime | kKv, "global");
@@ -353,7 +353,7 @@ Report BuildStatic(uintptr_t imageBase, size_t imageSize,
     // the image but resolution failed; builds that never instantiate the
     // wrapper (RTTI type absent) must not block playtime.
     {
-        const bool vtableOk = InRdata(r.getUserStatsVtable);
+        const bool vtableOk = InImage(r.getUserStatsVtable);
         if (vtableOk) {
             AddField(report, "getUserStatsVtable", true, kPlaytime, "vtable");
         } else if (r.getUserStatsVtableRttiAbsent) {
@@ -365,7 +365,7 @@ Report BuildStatic(uintptr_t imageBase, size_t imageSize,
     }
     AddField(report, "respDescriptor", InImage(r.respDescriptor),
              kPlaytime, "descriptor");
-    AddField(report, "respWrapperVtable", InRdata(r.respWrapperVtable),
+    AddField(report, "respWrapperVtable", InImage(r.respWrapperVtable),
              kPlaytime, "vtable");
     AddField(report, "regKeySyncTime", InImage(r.regKeySyncTime),
              kPlaytime, "global");
