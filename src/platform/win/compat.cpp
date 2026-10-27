@@ -472,17 +472,17 @@ bool LoadDynamicPatterns(const std::string& steamRoot, const std::string& sha256
     }
 
     // If not found locally, try remote mirrors.
-    // Source: this repository's own 'pattern' branch, populated by
-    // .github/workflows/update-patterns.yml (ExportFullPatterns output --
-    // [[patterns]] entries with the critical symbol names the resolver
-    // queries). steam-monitor's mirrored 'pattern' branch is NOT usable:
-    // mirror.yml force-replaces its whole tree every 10 min from an
+    // Source: steam-monitor's 'pattern-cloud' branch, which holds ONLY
+    // patterns/<sha>.toml (ExportFullPatterns output -- [[patterns]] entries
+    // with the critical symbol names the resolver queries), published manually
+    // from the maintainer's PC. steam-monitor's mirrored 'pattern' branch is
+    // NOT usable: mirror.yml force-replaces its whole tree every 10 min from an
     // unrelated upstream that publishes a different schema ([0xHASH]/rva/sig)
     // and none of the critical names.
     if (content.empty()) {
         static const std::vector<std::string> kPatternMirrors = {
-            "https://raw.githubusercontent.com/eisora08/CloudRedirect/pattern/patterns/",
-            "https://cdn.jsdelivr.net/gh/eisora08/CloudRedirect@pattern/patterns/"
+            "https://raw.githubusercontent.com/eisora08/steam-monitor/pattern-cloud/patterns/",
+            "https://cdn.jsdelivr.net/gh/eisora08/steam-monitor@pattern-cloud/patterns/"
         };
         for (const auto& base : kPatternMirrors) {
             std::string url = base + sha256 + ".toml";
