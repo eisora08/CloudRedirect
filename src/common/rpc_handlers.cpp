@@ -2091,11 +2091,21 @@ RpcResult HandleCompleteBatch(uint32_t appId, const std::vector<PB::Field>& reqB
             LOG("[NS] CompleteBatch DIAG app=%u: *** ALL OPS COMPLETED ON CR SIDE but Steam says failure - "
                 "possible: Steam HTTP timeout despite CR receiving data, or proto field mismatch ***", appId);
         }
-        PendingOpsJournal::RecordUploadBatchInterrupted(accountId, appId);
-        BatchTracker_Clear(accountId, appId, batch.batchId);
-        ClearBatchCanonicalTokens(accountId, appId);
-        ClearFileTokensDirty(accountId, appId);
-        return PB::Writer();
+
+        // Si hay uploads completados, tratamos como éxito parcial y procedemos
+        // con la promoción de lo que SÍ se subió, en lugar de descartar todo.
+        // Esto evita que el CN se quede atrás y Steam siga diciendo
+        // "unable to sync" (clientCN > cloudCN -> protected local saves).
+        if (batch.uploads.empty()) {
+            LOG("[NS] CompleteBatch app=%u: no uploads completed, failing batch", appId);
+            PendingOpsJournal::RecordUploadBatchInterrupted(accountId, appId);
+            BatchTracker_Clear(accountId, appId, batch.batchId);
+            ClearBatchCanonicalTokens(accountId, appId);
+            ClearFileTokensDirty(accountId, appId);
+            return PB::Writer();
+        }
+        LOG("[NS] CompleteBatch app=%u: proceeding with partial success (%zu uploads completed)",
+            appId, batch.uploads.size());
     }
 
     // Drain deferred file-token persists for this app only.
