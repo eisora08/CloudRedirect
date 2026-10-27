@@ -2,15 +2,17 @@ name: Update patterns
 
 # Generates the per-build pattern file ([[patterns]] TOML, first-match
 # verified .text captures -- GetAppInfo, FlushAppMinutesPlayed and the rest
-# of the critical set) for the runner's CURRENT Steam build and publishes
-# it to this repository's 'pattern' branch as patterns/<sha>.toml.
+# of the critical set) for the runner's CURRENT Steam build and reports the
+# compat verdict as a workflow notice.
 #
-# The DLL's LoadDynamicPatterns() downloads exactly that path. The branch is
-# owned by this repository, so nothing wipes it (steam-monitor's mirrored
-# 'pattern' branch force-replaces its tree every 10 min from its upstream and
-# serves a different format/content set -- it cannot host these files).
+# Publishing is MANUAL (maintainer's PC -> steam-monitor 'pattern-cloud'
+# branch, which holds ONLY patterns/<sha>.toml). This workflow used to push
+# to a 'pattern' branch in this repository, which forced the whole repo tree
+# onto that branch and has been removed.
 #
-# Pushes with GITHUB_TOKEN (no PAT required).
+# NOTE: steam-monitor's mirrored 'pattern' branch is unusable as a feed:
+# mirror.yml force-replaces its tree every 10 min from an upstream that
+# serves a different format/content set.
 
 on:
   workflow_dispatch:
@@ -25,8 +27,9 @@ on:
       - 'src/**'
       - 'CMakeLists.txt'
 
+# Read-only: this workflow no longer pushes (pattern publishing is manual).
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   update-patterns:
@@ -163,33 +166,17 @@ jobs:
           echo "patFile=$patFile" >> $env:GITHUB_OUTPUT
           exit $code
 
-      - name: Publish pattern (patterns/<sha>.toml on this repo's pattern branch)
+      - name: Report generated pattern (publishing is manual)
         if: steps.check.outputs.status == 'full'
         shell: pwsh
         run: |
           $sha = "${{ steps.check.outputs.sha }}"
           $patFile = "${{ steps.check.outputs.patFile }}"
-          New-Item -ItemType Directory -Force -Path patterns | Out-Null
-          Copy-Item $patFile "patterns\$sha.toml" -Force
-          git config user.name "pattern bot"
-          git config user.email "actions@users.noreply.github.com"
-          git add "patterns/$sha.toml"
-          if (git diff --cached --quiet) {
-            Write-Host "Pattern for $sha already present"
-            exit 0
-          }
-          git commit -m "pattern: add $sha"
-          # pattern branch == master + the pattern file; force-with-lease in
-          # case the branch tip has diverged from an older master.
-          $has = git ls-remote --exit-code --heads origin refs/heads/pattern
-          if ($LASTEXITCODE -eq 0) {
-            $lease = git rev-parse origin/pattern
-            git push --force-with-lease="refs/heads/pattern:$lease" origin HEAD:pattern
-          } else {
-            git push origin HEAD:pattern
-          }
+          Write-Host "::notice::Pattern generated for $sha ($patFile)."
+          Write-Host "Publish manually: copy it to steam-monitor's pattern-cloud branch as patterns/$sha.toml"
+          if (Test-Path $patFile) { Get-Content $patFile -Raw | Write-Host }
 
       - name: Notice when nothing was published
         if: steps.ensure.outputs.present == 'true' && steps.check.outputs.status != 'full'
         shell: pwsh
-        run: Write-Host "::notice::compat status is not 'full' for this build; pattern not published"
+        run: Write-Host "::notice::compat status is not 'full' for this build; pattern not generated"
