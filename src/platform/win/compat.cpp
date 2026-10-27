@@ -481,8 +481,8 @@ bool LoadDynamicPatterns(const std::string& steamRoot, const std::string& sha256
     // and none of the critical names.
     if (content.empty()) {
         static const std::vector<std::string> kPatternMirrors = {
-            "https://raw.githubusercontent.com/eisora08/steam-monitor/pattern-cloud/patterns/",
-            "https://cdn.jsdelivr.net/gh/eisora08/steam-monitor@pattern-cloud/patterns/"
+            "https://raw.githubusercontent.com/eisora08/CloudRedirect/pattern/patterns/",
+            "https://cdn.jsdelivr.net/gh/eisora08/CloudRedirect@pattern/patterns/"
         };
         for (const auto& base : kPatternMirrors) {
             std::string url = base + sha256 + ".toml";

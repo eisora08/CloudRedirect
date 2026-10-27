@@ -1058,52 +1058,17 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
     if (!r.getUserStatsVtable) {
         r.getUserStatsVtable = SigScanner::ResolveVtableByRtti(
             ".?AV?$CProtoBufMsg@VCMsgClientGetUserStats@@@@");
-        if (r.getUserStatsVtable) {
+        if (r.getUserStatsVtable)
             LOG("[Resolver] GetUserStatsVtable @ %p (RVA 0x%llX) via RTTI",
                 (void*)r.getUserStatsVtable, (uint64_t)(r.getUserStatsVtable - steamClientBase));
-        } else if (!SigScanner::RttiNamePresent(".?AV?$CProtoBufMsg@VCMsgClientGetUserStats@@@@")) {
-            // RTTI type absent: build doesn't instantiate the wrapper. Fallback:
-            // scan .rdata for a vtable array (sequence of QWORDs pointing into
-            // .text) near the resolved CMsgClientGetUserStats vtable, since
-            // related-class vtables tend to be co-located in .rdata.
+        else if (!SigScanner::RttiNamePresent(".?AV?$CProtoBufMsg@VCMsgClientGetUserStats@@@@")) {
+            // Some builds never instantiate this wrapper (schema fetch moved or
+            // removed). No vtable exists to steal; schema auto-fetch degrades
+            // gracefully at runtime, so report it as absent by design rather
+            // than a resolution failure.
             r.getUserStatsVtableRttiAbsent = true;
-            LOG("[Resolver] GetUserStatsVtable: RTTI type absent from image; "
-                "attempting .rdata vtable-array fallback");
-
-            uintptr_t msgVtable = SigScanner::ResolveVtableByRtti(
-                ".?AVCMsgClientGetUserStats@@");
-            if (msgVtable) {
-                const auto* rdata = reinterpret_cast<const uint8_t*>(
-                    SigScanner::GetRdataBase());
-                size_t rdataSize = SigScanner::GetRdataSize();
-                uintptr_t rdataBase = SigScanner::GetRdataBase();
-                uintptr_t textBase = SigScanner::GetTextBase();
-                uintptr_t textEnd = textBase + SigScanner::GetTextSize();
-                bool found = false;
-                // Scan .rdata for QWORDs pointing into .text (vtable entries),
-                // within +-0x200 bytes of the CMsgClientGetUserStats vtable ptr.
-                for (size_t i = 0; i + 8 <= rdataSize && !found; i += 8) {
-                    uintptr_t candidatePtr = *reinterpret_cast<const uintptr_t*>(rdata + i);
-                    if (candidatePtr >= textBase && candidatePtr < textEnd) {
-                        // Check if this could be a vtable: at least 2 consecutive
-                        // QWORDs pointing into .text
-                        uintptr_t nextPtr = *reinterpret_cast<const uintptr_t*>(rdata + i + 8);
-                        if (nextPtr >= textBase && nextPtr < textEnd) {
-                            uintptr_t vtableAddr = rdataBase + i;
-                            LOG("[Resolver] GetUserStatsVtable @ %p (RVA 0x%llX) "
-                                "via .rdata vtable-array fallback (near CMsgClientGetUserStats vtable)",
-                                (void*)vtableAddr, (uint64_t)(vtableAddr - steamClientBase));
-                            r.getUserStatsVtable = vtableAddr;
-                            found = true;
-                        }
-                    }
-                }
-                if (!found) {
-                    LOG("[Resolver] GetUserStatsVtable: .rdata fallback found no vtable array");
-                }
-            } else {
-                LOG("[Resolver] GetUserStatsVtable: CMsgClientGetUserStats RTTI also absent");
-            }
+            LOG("[Resolver] GetUserStatsVtable: RTTI type absent from image "
+                "(build does not instantiate the wrapper; schema auto-fetch unavailable)");
         } else {
             LOG("[Resolver] GetUserStatsVtable: RTTI type present but vtable not resolved");
         }
@@ -1231,15 +1196,15 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
 void LogComparison(const ResolvedAddrs& r, uintptr_t base) {
     LOG("[Resolver] === Comparison (resolved RVA vs expected) ===");
 
-    int total = 0, resolved = 0, failed = 0;
-    auto logEntry = [&](const char* name, uintptr_t resolvedAddr, uintptr_t expectedRva) {
+    int total = 0, matched = 0, failed = 0;
+    auto logEntry = [&](const char* name, uintptr_t resolved, uintptr_t expectedRva) {
         total++;
-        if (resolvedAddr) {
-            resolved++;
-            uintptr_t resolvedRva = resolvedAddr - base;
+        if (resolved) {
+            uintptr_t resolvedRva = resolved - base;
             bool match = (resolvedRva == expectedRva);
+            if (match) matched++;
             LOG("[Resolver]   %-30s 0x%llX  %s",
-                name, (uint64_t)resolvedRva, match ? "OK" : "differs-from-stale-RVA");
+                name, (uint64_t)resolvedRva, match ? "OK" : "MISMATCH");
         } else {
             failed++;
             LOG("[Resolver]   %-30s FAILED (expected 0x%llX)", name, (uint64_t)expectedRva);
@@ -1283,8 +1248,7 @@ void LogComparison(const ResolvedAddrs& r, uintptr_t base) {
     logEntry("RespDescriptor",         r.respDescriptor,          0x16D5590);
     logEntry("RegKeySyncTime",         r.regKeySyncTime,          0x16E8248);
 
-    LOG("[Resolver] Result: %d/%d resolved, %d failed (RVAs compared for reference only)",
-        resolved, total, failed);
+    LOG("[Resolver] Result: %d/%d matched, %d failed", matched, total, failed);
 }
 
 } // namespace ScResolver
