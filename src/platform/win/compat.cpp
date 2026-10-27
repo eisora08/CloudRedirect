@@ -745,10 +745,7 @@ Status Decide(const Report& local, bool feedPresent, Status feedStatus,
     }
     if (feedStatus == Status::Blocked) return Status::Blocked;
     if (feedStatus == Status::Full) return Status::Full;
-    // feedStatus is Audit/Unverified but the local report is Full. The feed is
-    // best-effort corroboration (no live Steam session on CI runners); it must
-    // not downgrade a locally verified Full report to Audit.
-    return Status::Full;
+    return Status::Audit;
 }
 
 Subsystems DecideSubsystems(const Report& local, bool feedPresent,
