@@ -1503,6 +1503,14 @@ RpcResult HandleLaunchIntent(uint32_t appId, const std::vector<PB::Field>& reqBo
         }
     }
 
+    // Warm the blob listing NOW (at launch, minutes before the first save) and
+    // keep it fresh every ~50s while this machine holds the session, so the
+    // publish at CompleteBatch/exit verifies against a cached listing instead
+    // of paying a multi-second inline one. Read-only; no-op on conflict.
+    if (!sessionConflict && CloudStorage::IsCloudActive()) {
+        CloudStorage::StartBlobListingRefresher(accountId, appId);
+    }
+
     // Don't clear UploadPending here: this runs before GetAppFileChangelist reads the
     // marker. RecordLaunchIntent re-persists it and honours ignorePendingOperations.
     auto pending = PendingOpsJournal::RecordLaunchIntent(
@@ -1627,6 +1635,12 @@ RpcResult HandleBeginBatch(uint32_t appId, const std::vector<PB::Field>& reqBody
     // FetchCloudStateForServe sees the fresh CN. Typically a no-op (single batch)
     // or instant (publish already landed between batches).
     CloudStorage::WaitForPendingPublish(accountId, appId);
+
+    // Start the blobs/ listing NOW, in parallel with the state fetch and the
+    // whole batch's upload+promote. VerifyAndHealManifestForPublish awaits it at
+    // publish time instead of paying a ~5s listing inside the ack window.
+    if (CloudStorage::IsCloudActive())
+        CloudStorage::PrefetchBlobListing(accountId, appId);
 
     // The CN returned here is what Steam records as synced and what we must publish
     // at CompleteBatch -- they have to match, or Steam re-downloads what it just

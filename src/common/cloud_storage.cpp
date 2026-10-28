@@ -21,7 +21,9 @@
 #include <chrono>
 #include <ctime>
 #include <cstring>
+#include <future>
 #include <list>
+#include <thread>
 #include <algorithm>
 #include <limits>
 #include <unordered_map>
@@ -136,6 +138,154 @@ static void InvalidateBlobListingCache(uint32_t accountId, uint32_t appId) {
     uint64_t key = (static_cast<uint64_t>(accountId) << 32) | appId;
     std::lock_guard<std::mutex> lk(g_blobListingCacheMtx);
     g_blobListingCache.erase(key);
+}
+
+static uint64_t BlobListingKey(uint32_t accountId, uint32_t appId) {
+    return (static_cast<uint64_t>(accountId) << 32) | appId;
+}
+
+// BeginBatch kicks off the blobs/ listing while the batch's blobs are still being
+// staged and uploaded, so VerifyAndHealManifestForPublish can WAIT for a listing
+// that is already in flight instead of starting its own inside the publish-critical
+// path. On GDrive that listing costs ~5s for a 150-blob app, which was the single
+// largest slice of the CompleteBatch ack.
+//
+// The listing is taken BEFORE our own uploads land, which is safe: the shas we
+// upload this session are short-circuited by IsBlobShaDurableThisSession, so the
+// listing only has to cover entries from earlier sessions.
+static std::mutex                                         g_blobListingPrefetchMtx;
+static std::unordered_map<uint64_t, std::shared_future<bool>> g_blobListingPrefetch;
+
+void PrefetchBlobListing(uint32_t accountId, uint32_t appId) {
+    if (IsShuttingDown()) return;
+
+    std::promise<bool> pr;
+    auto fut = pr.get_future().share();
+    {
+        std::lock_guard<std::mutex> lk(g_blobListingPrefetchMtx);
+        auto it = g_blobListingPrefetch.find(BlobListingKey(accountId, appId));
+        if (it != g_blobListingPrefetch.end()) {
+            if (it->second.valid() &&
+                it->second.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+                return;  // already listing for this app
+            }
+            g_blobListingPrefetch.erase(it);
+        }
+        g_blobListingPrefetch[BlobListingKey(accountId, appId)] = fut;
+    }
+
+    std::thread([accountId, appId, pr = std::move(pr)]() mutable {
+        bool ok = false;
+        InflightSyncScope guard;
+        if (guard && g_provider && g_provider->IsAuthenticated()) {
+            const std::string prefix = std::to_string(accountId) + "/" +
+                                       std::to_string(appId) + "/blobs/";
+            std::vector<ICloudProvider::FileInfo> blobs;
+            bool complete = false;
+            if (g_provider->ListChecked(prefix, blobs, &complete) && complete) {
+                SetCachedBlobListing(accountId, appId, blobs, complete);
+                LOG("[CloudStorage] PrefetchBlobListing app %u: %zu entries ready before publish",
+                    appId, blobs.size());
+                ok = true;
+            } else {
+                LOG("[CloudStorage] PrefetchBlobListing app %u: listing incomplete -- publish "
+                    "will list inline", appId);
+            }
+        }
+        pr.set_value(ok);
+    }).detach();
+}
+
+// ---- Keep-alive listing refresher -----------------------------------------
+// A listing is only trusted inside the 60s TTL, so a single prefetch at launch
+// would be worthless in a 1-2h session: by publish time it has long expired and
+// VerifyManifest would pay the full multi-second listing inline again. This
+// loop re-warms the cache every ~50s (always inside the TTL) while the app's
+// cloud session is active, so publish-time verification almost always finds a
+// fresh listing already cached.
+//
+// Safety: READ-ONLY. It fetches exactly the listing VerifyManifest would fetch
+// itself, at the same freshness bound (never older than the existing TTL). It
+// never widens what verification accepts -- it only starts collecting earlier.
+// Idempotent: a second Start for the same app is a no-op.
+static std::mutex g_refresherMtx;
+static std::unordered_map<uint64_t, std::shared_ptr<std::atomic<bool>>> g_refresherStop;
+
+void StartBlobListingRefresher(uint32_t accountId, uint32_t appId) {
+    if (IsShuttingDown()) return;
+    const uint64_t key = BlobListingKey(accountId, appId);
+    std::shared_ptr<std::atomic<bool>> stop;
+    {
+        std::lock_guard<std::mutex> lk(g_refresherMtx);
+        auto it = g_refresherStop.find(key);
+        if (it != g_refresherStop.end() && !it->second->load(std::memory_order_relaxed))
+            return;  // already running for this app
+        stop = std::make_shared<std::atomic<bool>>(false);
+        g_refresherStop[key] = stop;
+    }
+
+    std::thread([accountId, appId, stop]() {
+        PrefetchBlobListing(accountId, appId);   // warm immediately at launch
+        constexpr int kRefreshIntervalSec = 50;  // strictly < kBlobListingCacheTtlSec
+        while (!IsShuttingDown() && !stop->load(std::memory_order_relaxed)) {
+            for (int waited = 0; waited < kRefreshIntervalSec; ++waited) {
+                if (IsShuttingDown() || stop->load(std::memory_order_relaxed)) return;
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+            PrefetchBlobListing(accountId, appId);
+        }
+    }).detach();
+}
+
+void StopBlobListingRefresher(uint32_t accountId, uint32_t appId) {
+    std::lock_guard<std::mutex> lk(g_refresherMtx);
+    auto it = g_refresherStop.find(BlobListingKey(accountId, appId));
+    if (it != g_refresherStop.end()) {
+        it->second->store(true, std::memory_order_relaxed);
+        g_refresherStop.erase(it);  // thread keeps its own shared_ptr and exits
+    }
+}
+
+// Wait (bounded) for an in-flight prefetch and hand its result to the caller.
+// Returns false when there is nothing to wait for or the wait lost the race with
+// the direct path, in which case the caller falls back to cache/inline listing.
+static bool AwaitPrefetchedBlobListing(uint32_t accountId, uint32_t appId,
+                                        std::vector<ICloudProvider::FileInfo>& out) {
+    std::shared_future<bool> fut;
+    {
+        std::lock_guard<std::mutex> lk(g_blobListingPrefetchMtx);
+        auto it = g_blobListingPrefetch.find(BlobListingKey(accountId, appId));
+        if (it == g_blobListingPrefetch.end()) return false;
+        fut = it->second;
+    }
+    if (!fut.valid()) return false;
+    if (fut.wait_for(std::chrono::seconds(20)) != std::future_status::ready) return false;
+    if (!fut.get()) return false;
+    return GetCachedBlobListing(accountId, appId, out);
+}
+
+// Uploads do NOT invalidate the listing: we know exactly what we just added, so we
+// graft it in and keep the prefetched listing usable through the publish window.
+// The 60s TTL is left untouched, so a stale view still forces a real re-list, and
+// deletes keep invalidating (there we cannot know what vanished remotely).
+static void NoteUploadedBlobsToCache(uint32_t accountId, uint32_t appId,
+                                      const std::vector<ICloudProvider::UploadItem>& items) {
+    std::lock_guard<std::mutex> lk(g_blobListingCacheMtx);
+    auto it = g_blobListingCache.find(BlobListingKey(accountId, appId));
+    if (it == g_blobListingCache.end() || !it->second.complete) return;  // nothing cached yet
+    auto& blobs = it->second.blobs;
+    const uint64_t now = static_cast<uint64_t>(time(nullptr));
+    for (const auto& item : items) {
+        ICloudProvider::FileInfo fi;
+        fi.path = item.path;
+        fi.size = item.data.size();
+        fi.modifiedTime = now;
+        bool replaced = false;
+        for (auto& existing : blobs) {
+            if (existing.path == fi.path) { existing = fi; replaced = true; break; }
+        }
+        if (!replaced) blobs.push_back(std::move(fi));
+    }
 }
 
 // Serializes token persistence (root_token.dat, file_tokens.dat) across
@@ -1740,6 +1890,12 @@ bool VerifyAndHealManifestForPublish(uint32_t accountId, uint32_t appId,
     std::vector<ICloudProvider::FileInfo> remoteBlobs;
     bool fromCache = GetCachedBlobListing(accountId, appId, remoteBlobs);
     if (!fromCache) {
+        // A BeginBatch prefetch may still be listing; waiting on it here costs
+        // nothing (it started before the uploads) and usually saves the ~5s
+        // inline listing this path used to pay on every batch.
+        fromCache = AwaitPrefetchedBlobListing(accountId, appId, remoteBlobs);
+    }
+    if (!fromCache) {
         bool complete = false;
         if (!g_provider->ListChecked(blobPrefix, remoteBlobs, &complete) || !complete) {
             LOG("[CloudStorage] VerifyManifest app %u: blob listing unavailable; not publishing",
@@ -1902,7 +2058,9 @@ bool PromoteStagedBatchForCommit(uint32_t accountId, uint32_t appId,
     LOG("[CloudStorage] PromoteStagedBatch app %u batch %llu: promoted %zu upload(s), %zu delete(s)",
         appId, (unsigned long long)batchId, uploads.size(), deletes.size());
     InvalidateBlobIndex(accountId, appId);
-    InvalidateBlobListingCache(accountId, appId);
+    // Don't throw away the prefetched listing: graft the blobs we just made
+    // durable into it so VerifyManifest's view stays complete (and fresh).
+    NoteUploadedBlobsToCache(accountId, appId, batchItems);
     return true;
 }
 

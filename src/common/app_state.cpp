@@ -576,6 +576,14 @@ bool PublishCloudState(uint32_t accountId, uint32_t appId,
         return false;
     }
 
+    // Start the CN regression probe BEFORE blob verification so it overlaps the
+    // (multi-second) blob listing: both are independent downloads and the probe
+    // used to run strictly after verification, adding ~1s to the ack window.
+    auto cnProbe = std::async(std::launch::async, [accountId, appId]() {
+        return FetchCloudStateLive(accountId, appId,
+                                   /*allowLegacyMigration=*/false);
+    });
+
     // Heal or drop any manifest entry whose blob isn't durable on the provider, so
     // we never publish a state pointing at blobs that 404 elsewhere. lockOnly skips
     // it: a session-release publish reuses the manifest CompleteBatch just verified.
@@ -590,8 +598,7 @@ bool PublishCloudState(uint32_t accountId, uint32_t appId,
     // cloud CN and reject a stale RMW (e.g. the session lock republish) that would
     // clobber a newer CN another machine published in the window. Equal CN is fine.
     {
-        auto current = FetchCloudStateLive(accountId, appId,
-                                           /*allowLegacyMigration=*/false);
+        auto current = cnProbe.get();
         if (current.status == StateFetchStatus::Ok && current.state.cn > verified.cn) {
             LOG("[AppState] PublishCloudState app %u: REFUSED -- cloud CN=%llu is newer than "
                 "publish CN=%llu (would regress changelist); leaving cloud state intact",
@@ -614,19 +621,31 @@ bool PublishCloudState(uint32_t accountId, uint32_t appId,
     std::string json = SerializeState(verified);
     std::string statePath = CloudMetadataPath(accountId, appId, kStateFilename);
 
-    if (!g_stateProvider->Upload(statePath,
-            reinterpret_cast<const uint8_t*>(json.data()), json.size())) {
+    // cn.cloudredirect (2 bytes) only matters to the legacy-migration read path,
+    // which triggers solely when state.cloudredirect is ABSENT -- never while we
+    // are overwriting an existing one. So sending both in parallel is safe and
+    // saves one GDrive round-trip (~1s) from the ack window.
+    std::string cnStr, cnPath;
+    if (state.cn > 0) {
+        cnStr = std::to_string(state.cn);
+        cnPath = CloudMetadataPath(accountId, appId, CloudIntercept::kCNFilename);
+    }
+    auto cnUpload = std::async(std::launch::async, [&]() -> bool {
+        if (cnPath.empty()) return true;
+        // Keep cn.cloudredirect in sync for lightweight CN probes.
+        return g_stateProvider->Upload(cnPath,
+            reinterpret_cast<const uint8_t*>(cnStr.data()), cnStr.size());
+    });
+
+    bool stateOk = g_stateProvider->Upload(statePath,
+        reinterpret_cast<const uint8_t*>(json.data()), json.size());
+    bool cnOk = cnUpload.get();
+    if (!stateOk) {
         LOG("[AppState] PublishCloudState app %u: upload failed", appId);
         return false;
     }
-
-    // Keep cn.cloudredirect in sync for lightweight CN probes.
-    if (state.cn > 0) {
-        std::string cnStr = std::to_string(state.cn);
-        std::string cnPath = CloudMetadataPath(accountId, appId,
-            CloudIntercept::kCNFilename);
-        g_stateProvider->Upload(cnPath,
-            reinterpret_cast<const uint8_t*>(cnStr.data()), cnStr.size());
+    if (!cnOk && !cnPath.empty()) {
+        LOG("[AppState] PublishCloudState app %u: cn upload failed (non-fatal)", appId);
     }
 
     // A local mutation just landed: the serve cache's snapshot is now stale.
@@ -639,6 +658,10 @@ bool PublishCloudState(uint32_t accountId, uint32_t appId,
 }
 
 void ReleaseCloudSession(uint32_t accountId, uint32_t appId, uint64_t clientId) {
+    // Session is over: stop the keep-alive listing refresher for this app so
+    // no background traffic continues after the game exits.
+    CloudStorage::StopBlobListingRefresher(accountId, appId);
+
     // Wait for any deferred CompleteBatch publish to land before releasing the
     // session. This ensures the cloud state is durable (at the batch CN) before
     // another machine can acquire and fetch it.

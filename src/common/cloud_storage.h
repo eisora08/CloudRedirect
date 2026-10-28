@@ -68,6 +68,19 @@ bool ListRemoteBlobNames(uint32_t accountId, uint32_t appId,
 bool HasLocalBlob(uint32_t accountId, uint32_t appId,
                    const std::string& filename);
 
+// Fire-and-forget: start the blobs/ listing in the background so the publish
+// path can await a listing that is already in flight instead of issuing its own
+// inside the ack-critical window. Safe to call every BeginBatch; duplicate
+// in-flight listings for the same app are collapsed.
+void PrefetchBlobListing(uint32_t accountId, uint32_t appId);
+
+// Keep the listing cache warm (< 60s TTL) while an app's cloud session is
+// active: re-prefetches every ~50s so publish-time verification finds a fresh
+// listing instead of listing inline. Read-only, idempotent; Stop on session
+// release (and automatically on shutdown).
+void StartBlobListingRefresher(uint32_t accountId, uint32_t appId);
+void StopBlobListingRefresher(uint32_t accountId, uint32_t appId);
+
 // GC: delete unreferenced blobs. Returns count deleted, or -1 on error.
 int GarbageCollectBlobs(uint32_t accountId, uint32_t appId);
 
